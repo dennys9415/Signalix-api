@@ -124,9 +124,14 @@ export class ChatsService {
       beforeTs = before;
     }
 
-    const conditions: string[] = ['m.chat_id = $1', 'm.deleted_at IS NULL'];
-    const params: unknown[] = [chatId];
-    let nextIdx = 2;
+    // $1 = chatId, $2 = userId (for message_deletions exclusion)
+    const conditions: string[] = [
+      'm.chat_id = $1',
+      'm.deleted_at IS NULL',
+      'NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = m.id AND md.user_id = $2)',
+    ];
+    const params: unknown[] = [chatId, userId];
+    let nextIdx = 3;
 
     if (beforeTs) {
       conditions.push(`m.created_at < $${nextIdx}::timestamptz`);

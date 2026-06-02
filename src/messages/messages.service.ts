@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import {
+  DeleteMessageForMeResponse,
   ErrorCode,
   MessageDTO,
   MessageLifecycleState,
@@ -187,6 +188,49 @@ export class MessagesService {
     );
 
     return toStatusDTO(currentResult.rows[0]);
+  }
+
+  async deleteForMe(
+    messageId: string,
+    userId: string,
+  ): Promise<DeleteMessageForMeResponse> {
+    const msgResult = await this.db.query<{ chat_id: string }>(
+      'SELECT chat_id FROM messages WHERE id = $1 AND deleted_at IS NULL',
+      [messageId],
+    );
+
+    if (!msgResult.rows[0]) {
+      throw new NotFoundException({
+        code: ErrorCode.MESSAGE_NOT_FOUND,
+        message: 'Message not found.',
+      });
+    }
+
+    const participantCheck = await this.db.query(
+      'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+      [msgResult.rows[0].chat_id, userId],
+    );
+
+    if (participantCheck.rows.length === 0) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Not a participant in this chat.',
+      });
+    }
+
+    // Idempotent: if the row exists, the DO UPDATE is a no-op that still returns deleted_at.
+    const result = await this.db.query<{ deleted_at: Date }>(`
+      INSERT INTO message_deletions (message_id, user_id)
+      VALUES ($1, $2)
+      ON CONFLICT (message_id, user_id) DO UPDATE
+        SET deleted_at = message_deletions.deleted_at
+      RETURNING deleted_at
+    `, [messageId, userId]);
+
+    return {
+      messageId,
+      deletedAt: result.rows[0].deleted_at.toISOString(),
+    };
   }
 }
 

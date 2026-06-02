@@ -23,6 +23,27 @@ export class UsersService {
     const row = result.rows[0];
     if (!row) return null;
 
+    return this.toPublicDTO(row);
+  }
+
+  async searchUsers(
+    query: string,
+    limit: number,
+    excludeUserId: string,
+  ): Promise<PublicUserDTO[]> {
+    const result = await this.db.query<UserRow>(`
+      SELECT id, username, display_name, avatar_url
+      FROM users
+      WHERE username ILIKE $1
+        AND id != $2
+      ORDER BY username
+      LIMIT $3
+    `, [`%${query}%`, excludeUserId, limit]);
+
+    return result.rows.map((row) => this.toPublicDTO(row));
+  }
+
+  private toPublicDTO(row: UserRow): PublicUserDTO {
     return {
       id: row.id,
       username: row.username,

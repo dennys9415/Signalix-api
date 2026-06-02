@@ -28,6 +28,13 @@ interface SessionRow {
   expires_at: Date;
 }
 
+interface CreateSessionOpts {
+  deviceId?: string;   // if set, reuse existing device instead of inserting new one
+  deviceName?: string;
+  ip?: string;
+  userAgent?: string;
+}
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -75,9 +82,11 @@ export class AuthService {
         VALUES ($1, 'local', $2)
       `, [userId, userId]);
 
-      return this.createDeviceSession(
-        client, userId, dto.deviceName, ip, dto.userAgent,
-      );
+      return this.createDeviceSession(client, userId, {
+        deviceName: dto.deviceName,
+        ip,
+        userAgent: dto.userAgent,
+      });
     });
   }
 
@@ -108,22 +117,56 @@ export class AuthService {
       });
     }
 
-    const countResult = await this.db.query<{ count: string }>(`
-      SELECT COUNT(*) AS count
-      FROM device_sessions
-      WHERE user_id = $1 AND revoked = false AND expires_at > NOW()
-    `, [user.id]);
+    return this.db.transaction(async (client) => {
+      // If the client sends a user_agent, look for an existing active session from
+      // the same browser. If found, revoke it and reuse the device so that repeated
+      // logins from the same browser do not consume additional device slots.
+      let reuseDeviceId: string | undefined;
 
-    if (parseInt(countResult.rows[0].count, 10) >= MAX_ACTIVE_DEVICES_PER_USER) {
-      throw new ForbiddenException({
-        code: ErrorCode.DEVICE_LIMIT_REACHED,
-        message: 'Maximum active device limit reached.',
+      if (dto.userAgent) {
+        const existing = await client.query<{ id: string; device_id: string }>(`
+          SELECT id, device_id
+          FROM device_sessions
+          WHERE user_id    = $1
+            AND user_agent = $2
+            AND revoked    = false
+            AND expires_at > NOW()
+          ORDER BY created_at DESC
+          LIMIT 1
+        `, [user.id, dto.userAgent]);
+
+        if (existing.rows[0]) {
+          await client.query(
+            'UPDATE device_sessions SET revoked = true, updated_at = NOW() WHERE id = $1',
+            [existing.rows[0].id],
+          );
+          reuseDeviceId = existing.rows[0].device_id;
+        }
+      }
+
+      // Only enforce the device cap when we are not reusing an existing slot.
+      if (!reuseDeviceId) {
+        const countResult = await client.query<{ count: string }>(`
+          SELECT COUNT(*) AS count
+          FROM device_sessions
+          WHERE user_id = $1 AND revoked = false AND expires_at > NOW()
+        `, [user.id]);
+
+        if (parseInt(countResult.rows[0].count, 10) >= MAX_ACTIVE_DEVICES_PER_USER) {
+          throw new ForbiddenException({
+            code: ErrorCode.DEVICE_LIMIT_REACHED,
+            message: 'Maximum active device limit reached.',
+          });
+        }
+      }
+
+      return this.createDeviceSession(client, user.id, {
+        deviceId: reuseDeviceId,
+        deviceName: dto.deviceName,
+        ip,
+        userAgent: dto.userAgent,
       });
-    }
-
-    return this.db.transaction((client) =>
-      this.createDeviceSession(client, user.id, dto.deviceName, ip, dto.userAgent),
-    );
+    });
   }
 
   async refresh(refreshToken: string): Promise<AuthSessionDTO> {
@@ -169,26 +212,32 @@ export class AuthService {
   private async createDeviceSession(
     client: PoolClient,
     userId: string,
-    deviceName?: string,
-    ip?: string,
-    userAgent?: string,
+    opts: CreateSessionOpts,
   ): Promise<AuthSessionDTO> {
-    const deviceId = randomUUID();
+    const deviceId = opts.deviceId ?? randomUUID();
     const sessionId = randomUUID();
     const refreshTokenRaw = randomBytes(32).toString('hex');
     const refreshTokenHash = hashToken(refreshTokenRaw);
     const refreshExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
-    await client.query(`
-      INSERT INTO devices (id, user_id, device_name, device_type, last_seen)
-      VALUES ($1, $2, $3, 'web', NOW())
-    `, [deviceId, userId, deviceName ?? null]);
+    if (opts.deviceId) {
+      // Reusing an existing device — just bump last_seen.
+      await client.query(
+        'UPDATE devices SET last_seen = NOW() WHERE id = $1',
+        [deviceId],
+      );
+    } else {
+      await client.query(`
+        INSERT INTO devices (id, user_id, device_name, device_type, last_seen)
+        VALUES ($1, $2, $3, 'web', NOW())
+      `, [deviceId, userId, opts.deviceName ?? null]);
+    }
 
     await client.query(`
       INSERT INTO device_sessions
         (id, user_id, device_id, refresh_token_hash, ip, user_agent, last_seen, expires_at)
       VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
-    `, [sessionId, userId, deviceId, refreshTokenHash, ip ?? null, userAgent ?? null, refreshExpiresAt]);
+    `, [sessionId, userId, deviceId, refreshTokenHash, opts.ip ?? null, opts.userAgent ?? null, refreshExpiresAt]);
 
     const { accessToken, accessTokenExpiresAt } = this.buildAccessToken(userId, deviceId);
 

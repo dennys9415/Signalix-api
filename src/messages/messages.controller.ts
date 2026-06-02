@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import type {
   ApiResponse,
+  DeleteMessageForMeResponse,
   MessageStatusDTO,
   SendMessageResponse,
 } from '@signalix/contracts';
@@ -47,6 +48,16 @@ export class MessagesController {
       user.sub,
       dto.status,
     );
+    return ok(result);
+  }
+
+  @Post(':messageId/delete-for-me')
+  @HttpCode(HttpStatus.OK)
+  async deleteForMe(
+    @Param('messageId') messageId: string,
+    @CurrentUser() user: JwtPayload,
+  ): Promise<ApiResponse<DeleteMessageForMeResponse>> {
+    const result = await this.messagesService.deleteForMe(messageId, user.sub);
     return ok(result);
   }
 }
