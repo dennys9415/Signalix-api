@@ -2,6 +2,7 @@ import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
 import type {
   ApiResponse,
   ExactUsernameLookupResponse,
+  UserProfileResponse,
   UserSearchResponse,
 } from '@signalix/contracts';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -15,6 +16,14 @@ import { UsersService } from './users.service';
 @UseGuards(JwtAuthGuard)
 export class UsersController {
   constructor(private readonly usersService: UsersService) {}
+
+  @Get('me')
+  async me(
+    @CurrentUser() user: JwtPayload,
+  ): Promise<ApiResponse<UserProfileResponse>> {
+    const profile = await this.usersService.getProfile(user.sub);
+    return ok(profile);
+  }
 
   @Get('search')
   async search(

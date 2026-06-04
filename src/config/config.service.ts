@@ -33,4 +33,62 @@ export class ConfigService {
   get jwtRefreshExpiresIn(): string {
     return this.require('JWT_REFRESH_EXPIRES_IN', '30d');
   }
+
+  get frontendUrl(): string {
+    return this.require('FRONTEND_URL', 'http://localhost:3000');
+  }
+
+  get googleClientId(): string {
+    return this.require('GOOGLE_CLIENT_ID');
+  }
+
+  get googleClientSecret(): string {
+    return this.require('GOOGLE_CLIENT_SECRET');
+  }
+
+  get googleCallbackUrl(): string {
+    return this.require('GOOGLE_CALLBACK_URL', 'http://localhost:4000/api/v1/auth/google/callback');
+  }
+
+  get githubClientId(): string {
+    return this.require('GITHUB_CLIENT_ID');
+  }
+
+  get githubClientSecret(): string {
+    return this.require('GITHUB_CLIENT_SECRET');
+  }
+
+  get githubCallbackUrl(): string {
+    return this.require('GITHUB_CALLBACK_URL', 'http://localhost:4000/api/v1/auth/github/callback');
+  }
+
+  get appleClientId(): string {
+    return this.require('APPLE_CLIENT_ID');
+  }
+
+  get appleTeamId(): string {
+    return this.require('APPLE_TEAM_ID');
+  }
+
+  get appleKeyId(): string {
+    return this.require('APPLE_KEY_ID');
+  }
+
+  // The .p8 private key content. Store with literal \n for newlines in the env var.
+  get applePrivateKey(): string {
+    return this.require('APPLE_PRIVATE_KEY');
+  }
+
+  get appleCallbackUrl(): string {
+    return this.require('APPLE_CALLBACK_URL');
+  }
+
+  // Empty-string fallback: EmailService skips sending and falls back to console.
+  get resendApiKey(): string {
+    return this.require('RESEND_API_KEY', '');
+  }
+
+  get emailFrom(): string {
+    return this.require('EMAIL_FROM', 'Signalix <onboarding@resend.dev>');
+  }
 }
