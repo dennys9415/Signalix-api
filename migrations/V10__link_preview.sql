@@ -1,0 +1,1 @@
+ALTER TABLE messages ADD COLUMN link_preview JSONB DEFAULT NULL;

@@ -91,4 +91,36 @@ export class ConfigService {
   get emailFrom(): string {
     return this.require('EMAIL_FROM', 'Signalix <onboarding@resend.dev>');
   }
+
+  get minioEndpoint(): string {
+    return this.require('MINIO_ENDPOINT', 'http://minio:9000');
+  }
+
+  get minioPublicUrl(): string {
+    return this.require('MINIO_PUBLIC_URL', 'http://localhost:9000');
+  }
+
+  get minioRegion(): string {
+    return this.require('MINIO_REGION', 'us-east-1');
+  }
+
+  get minioAccessKey(): string {
+    return this.require('MINIO_ACCESS_KEY', 'signalix');
+  }
+
+  get minioSecretKey(): string {
+    return this.require('MINIO_SECRET_KEY', 'signalix_minio_password');
+  }
+
+  get minioAvatarsBucket(): string {
+    return this.require('MINIO_BUCKET_AVATARS', 'signalix-avatars');
+  }
+
+  get minioMediaBucket(): string {
+    return this.require('MINIO_BUCKET_MEDIA', 'signalix-media');
+  }
+
+  get minioFilesBucket(): string {
+    return this.require('MINIO_BUCKET_FILES', 'signalix-files');
+  }
 }

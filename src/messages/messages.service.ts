@@ -6,16 +6,22 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import {
+  DeleteMessageForEveryoneResponse,
   DeleteMessageForMeResponse,
+  EditMessageResponse,
   ErrorCode,
   MessageDTO,
   MessageLifecycleState,
+  MessageReactionDTO,
   MessageStatus,
   MessageStatusDTO,
   MessageType,
+  ReactionResponse,
+  ReplyPreviewDTO,
   SendMessageResponse,
 } from '@signalix/contracts';
 import { DbService } from '../db/db.service';
+import { LinkPreviewService } from '../link-preview/link-preview.service';
 import type { SendMessageDto } from './dto/send-message.dto';
 
 interface MessageStatusRow {
@@ -27,13 +33,16 @@ interface MessageStatusRow {
 
 @Injectable()
 export class MessagesService {
-  constructor(private readonly db: DbService) {}
+  constructor(
+    private readonly db: DbService,
+    private readonly linkPreview: LinkPreviewService,
+  ) {}
 
   async sendMessage(
     senderId: string,
     dto: SendMessageDto,
   ): Promise<SendMessageResponse> {
-    return this.db.transaction(async (client) => {
+    const result = await this.db.transaction(async (client) => {
       let chatId: string;
 
       if (dto.chatId) {
@@ -96,13 +105,40 @@ export class MessagesService {
         });
       }
 
+      // Validate and resolve reply preview
+      let replyTo: ReplyPreviewDTO | undefined;
+      if (dto.replyToMessageId) {
+        const replyRow = await client.query<{
+          chat_id: string;
+          sender_id: string;
+          ciphertext: string;
+          deleted_at: Date | null;
+        }>(
+          'SELECT chat_id, sender_id, ciphertext, deleted_at FROM messages WHERE id = $1',
+          [dto.replyToMessageId],
+        );
+        if (!replyRow.rows[0] || replyRow.rows[0].chat_id !== chatId) {
+          throw new BadRequestException({
+            code: ErrorCode.VALIDATION_ERROR,
+            message: 'Invalid reply target.',
+          });
+        }
+        if (!replyRow.rows[0].deleted_at) {
+          replyTo = {
+            messageId: dto.replyToMessageId,
+            senderId: replyRow.rows[0].sender_id,
+            ciphertext: replyRow.rows[0].ciphertext,
+          };
+        }
+      }
+
       const msgId = randomUUID();
       const now = new Date();
 
       await client.query(`
-        INSERT INTO messages (id, chat_id, sender_id, ciphertext, message_type)
-        VALUES ($1, $2, $3, $4, 'text')
-      `, [msgId, chatId, senderId, dto.ciphertext]);
+        INSERT INTO messages (id, chat_id, sender_id, ciphertext, message_type, reply_to, is_forwarded)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `, [msgId, chatId, senderId, dto.ciphertext, dto.messageType, dto.replyToMessageId ?? null, dto.isForwarded ?? false]);
 
       await client.query(
         'INSERT INTO message_status (message_id, user_id, status) VALUES ($1, $2, $3)',
@@ -114,14 +150,22 @@ export class MessagesService {
         [chatId],
       );
 
+      // Reappearance: clear any personal chat deletions so the chat resurfaces for everyone
+      await client.query(
+        'DELETE FROM chat_deletions WHERE chat_id = $1',
+        [chatId],
+      );
+
       const message: MessageDTO = {
         id: msgId,
         chatId,
         senderId,
         ciphertext: dto.ciphertext,
-        messageType: MessageType.TEXT,
+        messageType: dto.messageType,
         state: MessageLifecycleState.SENT,
         createdAt: now.toISOString(),
+        ...(replyTo && { replyTo }),
+        ...(dto.isForwarded && { isForwarded: true }),
       };
 
       return {
@@ -130,6 +174,25 @@ export class MessagesService {
         ...(dto.tempId ? { tempId: dto.tempId } : {}),
       };
     });
+
+    // Generate link preview after transaction — failure must never block the send
+    if (result.message.messageType === MessageType.TEXT) {
+      const url = this.linkPreview.extractFirstUrl(result.message.ciphertext);
+      if (url) {
+        try {
+          const preview = await this.linkPreview.fetchPreview(url);
+          if (preview) {
+            await this.db.query(
+              'UPDATE messages SET link_preview = $1 WHERE id = $2',
+              [JSON.stringify(preview), result.message.id],
+            );
+            return { ...result, message: { ...result.message, linkPreview: preview } };
+          }
+        } catch { /* preview errors must not surface to the caller */ }
+      }
+    }
+
+    return result;
   }
 
   async updateStatus(
@@ -231,6 +294,231 @@ export class MessagesService {
       messageId,
       deletedAt: result.rows[0].deleted_at.toISOString(),
     };
+  }
+
+  async deleteForEveryone(
+    messageId: string,
+    userId: string,
+  ): Promise<DeleteMessageForEveryoneResponse> {
+    const msgResult = await this.db.query<{
+      chat_id: string;
+      sender_id: string;
+      deleted_at: Date | null;
+    }>(
+      'SELECT chat_id, sender_id, deleted_at FROM messages WHERE id = $1',
+      [messageId],
+    );
+
+    if (!msgResult.rows[0]) {
+      throw new NotFoundException({
+        code: ErrorCode.MESSAGE_NOT_FOUND,
+        message: 'Message not found.',
+      });
+    }
+
+    const { chat_id: chatId, sender_id: senderId, deleted_at: existingDeletedAt } =
+      msgResult.rows[0];
+
+    if (senderId !== userId) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Only the sender can delete this message for everyone.',
+      });
+    }
+
+    const participantCheck = await this.db.query(
+      'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+      [chatId, userId],
+    );
+
+    if (participantCheck.rows.length === 0) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Not a participant in this chat.',
+      });
+    }
+
+    // Idempotent: already deleted — return existing timestamp
+    if (existingDeletedAt) {
+      return { messageId, chatId, deletedAt: existingDeletedAt.toISOString() };
+    }
+
+    const result = await this.db.query<{ deleted_at: Date }>(
+      'UPDATE messages SET deleted_at = NOW() WHERE id = $1 RETURNING deleted_at',
+      [messageId],
+    );
+
+    return { messageId, chatId, deletedAt: result.rows[0].deleted_at.toISOString() };
+  }
+
+  async editMessage(
+    messageId: string,
+    userId: string,
+    ciphertext: string,
+  ): Promise<EditMessageResponse> {
+    const msgResult = await this.db.query<{
+      chat_id: string;
+      sender_id: string;
+      deleted_at: Date | null;
+    }>(
+      'SELECT chat_id, sender_id, deleted_at FROM messages WHERE id = $1',
+      [messageId],
+    );
+
+    if (!msgResult.rows[0]) {
+      throw new NotFoundException({
+        code: ErrorCode.MESSAGE_NOT_FOUND,
+        message: 'Message not found.',
+      });
+    }
+
+    const { chat_id: chatId, sender_id: senderId, deleted_at: deletedAt } = msgResult.rows[0];
+
+    if (senderId !== userId) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Only the sender can edit this message.',
+      });
+    }
+
+    if (deletedAt) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Cannot edit a deleted message.',
+      });
+    }
+
+    const participantCheck = await this.db.query(
+      'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+      [chatId, userId],
+    );
+
+    if (participantCheck.rows.length === 0) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Not a participant in this chat.',
+      });
+    }
+
+    const result = await this.db.query<{ edited_at: Date }>(
+      'UPDATE messages SET ciphertext = $1, edited_at = NOW() WHERE id = $2 RETURNING edited_at',
+      [ciphertext, messageId],
+    );
+
+    return {
+      messageId,
+      chatId,
+      ciphertext,
+      editedAt: result.rows[0].edited_at.toISOString(),
+    };
+  }
+
+  async setReaction(
+    messageId: string,
+    userId: string,
+    emoji: string,
+  ): Promise<ReactionResponse> {
+    const msgResult = await this.db.query<{ chat_id: string; deleted_at: Date | null }>(
+      'SELECT chat_id, deleted_at FROM messages WHERE id = $1',
+      [messageId],
+    );
+
+    if (!msgResult.rows[0]) {
+      throw new NotFoundException({
+        code: ErrorCode.MESSAGE_NOT_FOUND,
+        message: 'Message not found.',
+      });
+    }
+
+    const { chat_id: chatId, deleted_at: deletedAt } = msgResult.rows[0];
+
+    if (deletedAt) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Cannot react to a deleted message.',
+      });
+    }
+
+    const participantCheck = await this.db.query(
+      'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+      [chatId, userId],
+    );
+
+    if (participantCheck.rows.length === 0) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Not a participant in this chat.',
+      });
+    }
+
+    await this.db.query(`
+      INSERT INTO message_reactions (message_id, user_id, emoji)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (message_id, user_id) DO UPDATE
+        SET emoji = EXCLUDED.emoji, created_at = NOW()
+    `, [messageId, userId, emoji]);
+
+    const reactions = await this.getReactionsForMessage(messageId);
+    return { messageId, chatId, reactions };
+  }
+
+  async removeReaction(
+    messageId: string,
+    userId: string,
+  ): Promise<ReactionResponse> {
+    const msgResult = await this.db.query<{ chat_id: string }>(
+      'SELECT chat_id FROM messages WHERE id = $1',
+      [messageId],
+    );
+
+    if (!msgResult.rows[0]) {
+      throw new NotFoundException({
+        code: ErrorCode.MESSAGE_NOT_FOUND,
+        message: 'Message not found.',
+      });
+    }
+
+    const { chat_id: chatId } = msgResult.rows[0];
+
+    const participantCheck = await this.db.query(
+      'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+      [chatId, userId],
+    );
+
+    if (participantCheck.rows.length === 0) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Not a participant in this chat.',
+      });
+    }
+
+    await this.db.query(
+      'DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2',
+      [messageId, userId],
+    );
+
+    const reactions = await this.getReactionsForMessage(messageId);
+    return { messageId, chatId, reactions };
+  }
+
+  private async getReactionsForMessage(messageId: string): Promise<MessageReactionDTO[]> {
+    const result = await this.db.query<{ emoji: string; user_id: string }>(
+      'SELECT emoji, user_id FROM message_reactions WHERE message_id = $1 ORDER BY created_at',
+      [messageId],
+    );
+
+    const emojiMap = new Map<string, string[]>();
+    for (const row of result.rows) {
+      const ids = emojiMap.get(row.emoji) ?? [];
+      ids.push(row.user_id);
+      emojiMap.set(row.emoji, ids);
+    }
+
+    return Array.from(emojiMap.entries()).map(([emoji, userIds]) => ({
+      emoji,
+      count: userIds.length,
+      userIds,
+    }));
   }
 }
 

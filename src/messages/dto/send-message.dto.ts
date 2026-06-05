@@ -1,4 +1,5 @@
 import {
+  IsBoolean,
   IsIn,
   IsNotEmpty,
   IsOptional,
@@ -20,11 +21,18 @@ export class SendMessageDto implements SendMessageRequest {
   @IsNotEmpty()
   ciphertext!: string;
 
-  // v0.1 supports text only
-  @IsIn([MessageType.TEXT])
-  messageType!: MessageType.TEXT;
+  @IsIn([MessageType.TEXT, MessageType.IMAGE, MessageType.FILE])
+  messageType!: MessageType.TEXT | MessageType.IMAGE | MessageType.FILE;
 
   @IsOptional()
   @IsString()
   tempId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  replyToMessageId?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  isForwarded?: boolean;
 }

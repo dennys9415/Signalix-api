@@ -32,10 +32,17 @@ This is `Signalix-api`, the NestJS REST API for Signalix v0.1.
 ## Migration naming
 
 ```
-V1__init.sql       — pgcrypto + users
-V2__auth.sql       — auth_providers + devices + device_sessions
-V3__chat.sql       — chats + messages + message_status + presence
-V4__<name>.sql     — next migration (increment only, never edit existing)
+V1__init.sql              — pgcrypto + users
+V2__auth.sql              — auth_providers + devices + device_sessions
+V3__chat.sql              — chats + messages + message_status + presence
+V4__message_deletions.sql — per-user message deletions
+V5__password_reset.sql    — password reset tokens
+V6__email_verification.sql — email verification tokens
+V7__chat_deletions.sql    — per-user chat deletions
+V8__message_reactions.sql — emoji reactions
+V9__message_reply_forward.sql — reply/forward metadata
+V10__link_preview.sql     — link_preview JSONB column on messages
+V11__read_state.sql       — chat_read_state table for persistent unread counts
 ```
 
 Never edit a deployed migration. Always add a new file.

@@ -1,8 +1,10 @@
-import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, HttpCode, HttpStatus, Param, Post, Query, UseGuards } from '@nestjs/common';
 import type {
   ApiResponse,
   ChatDTO,
+  DeleteChatForMeResponse,
   GetMessagesResponse,
+  MarkChatReadResponse,
 } from '@signalix/contracts';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import type { JwtPayload } from '../auth/guards/jwt-auth.guard';
@@ -44,5 +46,25 @@ export class ChatsController {
         ...(nextCursor !== undefined && { nextCursor }),
       },
     });
+  }
+
+  @Post(':chatId/read')
+  @HttpCode(HttpStatus.OK)
+  async markChatRead(
+    @Param('chatId') chatId: string,
+    @CurrentUser() user: JwtPayload,
+  ): Promise<ApiResponse<MarkChatReadResponse>> {
+    const result = await this.chatsService.markChatRead(chatId, user.sub);
+    return ok(result);
+  }
+
+  @Post(':chatId/delete-for-me')
+  @HttpCode(HttpStatus.OK)
+  async deleteChatForMe(
+    @Param('chatId') chatId: string,
+    @CurrentUser() user: JwtPayload,
+  ): Promise<ApiResponse<DeleteChatForMeResponse>> {
+    const result = await this.chatsService.deleteChatForMe(chatId, user.sub);
+    return ok(result);
   }
 }
