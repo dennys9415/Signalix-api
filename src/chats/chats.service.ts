@@ -1,9 +1,11 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import {
   ChatDTO,
+  ChatParticipantDTO,
   ChatType,
   DeleteChatForMeResponse,
   ErrorCode,
+  GroupMemberUpdateResponse,
   LinkPreviewDTO,
   MarkChatReadResponse,
   MessageDTO,
@@ -11,13 +13,16 @@ import {
   MessageReactionDTO,
   MessageType,
   ParticipantRole,
+  RemoveGroupMemberResponse,
   ReplyPreviewDTO,
+  UpdateGroupChatResponse,
 } from '@signalix/contracts';
 import { DbService } from '../db/db.service';
 
 interface ChatRow {
   chat_id: string;
   chat_type: string;
+  chat_title: string | null;
   created_by: string;
   chat_created_at: Date;
   participant_user_id: string;
@@ -58,6 +63,7 @@ export class ChatsService {
       SELECT
         c.id         AS chat_id,
         c.type       AS chat_type,
+        c.title      AS chat_title,
         c.created_by,
         c.created_at AS chat_created_at,
         cp.user_id   AS participant_user_id,
@@ -73,7 +79,13 @@ export class ChatsService {
         SELECT chat_id FROM chat_participants WHERE user_id = $1
       )
       AND NOT EXISTS (
-        SELECT 1 FROM chat_deletions cd WHERE cd.chat_id = c.id AND cd.user_id = $1
+        SELECT 1 FROM chat_deletions cd
+        WHERE cd.chat_id = c.id
+          AND cd.user_id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM messages m2
+            WHERE m2.chat_id = c.id AND m2.created_at > cd.deleted_at
+          )
       )
       ORDER BY c.updated_at DESC, c.id
     `, [userId]);
@@ -86,6 +98,7 @@ export class ChatsService {
         chatsMap.set(row.chat_id, {
           id: row.chat_id,
           type: row.chat_type as ChatType,
+          ...(row.chat_title !== null && { title: row.chat_title }),
           createdBy: row.created_by,
           createdAt: row.chat_created_at.toISOString(),
           participants: [],
@@ -120,8 +133,12 @@ export class ChatsService {
         AND NOT EXISTS (
           SELECT 1 FROM message_deletions md WHERE md.message_id = m.id AND md.user_id = $2
         )
-        AND NOT EXISTS (
-          SELECT 1 FROM chat_deletions cd WHERE cd.chat_id = m.chat_id AND cd.user_id = $2
+        AND NOT (
+          EXISTS (SELECT 1 FROM chat_deletions cd WHERE cd.chat_id = m.chat_id AND cd.user_id = $2)
+          AND m.created_at <= (
+            SELECT cd2.deleted_at FROM chat_deletions cd2
+            WHERE cd2.chat_id = m.chat_id AND cd2.user_id = $2 LIMIT 1
+          )
         )
         AND (
           NOT EXISTS (
@@ -219,9 +236,11 @@ export class ChatsService {
     // $1 = chatId, $2 = userId (for message_deletions exclusion)
     // Include messages deleted for everyone (shown as placeholders).
     // Exclude only personal deletions on messages that are NOT globally deleted.
+    // Honor chat_deletions.deleted_at as a visibility cutoff for this user.
     const conditions: string[] = [
       'm.chat_id = $1',
       '(m.deleted_at IS NOT NULL OR NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = m.id AND md.user_id = $2))',
+      '(NOT EXISTS (SELECT 1 FROM chat_deletions cd WHERE cd.chat_id = $1 AND cd.user_id = $2) OR m.created_at > (SELECT cd2.deleted_at FROM chat_deletions cd2 WHERE cd2.chat_id = $1 AND cd2.user_id = $2 LIMIT 1))',
     ];
     const params: unknown[] = [chatId, userId];
     let nextIdx = 3;
@@ -307,6 +326,230 @@ export class ChatsService {
     return { messages, nextCursor, hasMore };
   }
 
+  async createGroupChat(
+    creatorId: string,
+    title: string,
+    memberIds: string[],
+  ): Promise<ChatDTO> {
+    const deduped = [...new Set(memberIds.filter((id) => id !== creatorId))];
+    if (deduped.length < 2) {
+      throw new BadRequestException({
+        code: ErrorCode.VALIDATION_ERROR,
+        message: 'A group chat requires at least 2 other members.',
+      });
+    }
+
+    // Verify all member IDs exist in one query
+    const memberCheck = await this.db.query<{ id: string }>(
+      'SELECT id FROM users WHERE id = ANY($1::uuid[])',
+      [deduped],
+    );
+    if (memberCheck.rows.length !== deduped.length) {
+      throw new BadRequestException({
+        code: ErrorCode.VALIDATION_ERROR,
+        message: 'One or more member IDs are invalid.',
+      });
+    }
+
+    return this.db.transaction(async (client) => {
+      const chatResult = await client.query<{ id: string; created_at: Date }>(
+        `INSERT INTO chats (type, title, created_by)
+         VALUES ('group', $1, $2)
+         RETURNING id, created_at`,
+        [title.trim(), creatorId],
+      );
+      const { id: chatId, created_at } = chatResult.rows[0];
+
+      // Insert creator as owner
+      await client.query(
+        `INSERT INTO chat_participants (chat_id, user_id, role) VALUES ($1, $2, 'owner')`,
+        [chatId, creatorId],
+      );
+
+      // Insert all other members
+      for (const memberId of deduped) {
+        await client.query(
+          `INSERT INTO chat_participants (chat_id, user_id, role) VALUES ($1, $2, 'member')`,
+          [chatId, memberId],
+        );
+      }
+
+      // Fetch full participant data including user info
+      const participantsResult = await client.query<{
+        user_id: string; role: string; joined_at: Date;
+        username: string; display_name: string; avatar_url: string | null;
+      }>(
+        `SELECT cp.user_id, cp.role, cp.joined_at, u.username, u.display_name, u.avatar_url
+         FROM chat_participants cp
+         JOIN users u ON u.id = cp.user_id
+         WHERE cp.chat_id = $1`,
+        [chatId],
+      );
+
+      const participants: ChatParticipantDTO[] = participantsResult.rows.map((r) => ({
+        chatId,
+        userId: r.user_id,
+        role: r.role as ParticipantRole,
+        joinedAt: r.joined_at.toISOString(),
+        user: {
+          id: r.user_id,
+          username: r.username,
+          displayName: r.display_name,
+          ...(r.avatar_url !== null && { avatarUrl: r.avatar_url }),
+        },
+      }));
+
+      return {
+        id: chatId,
+        type: ChatType.GROUP,
+        title: title.trim(),
+        createdBy: creatorId,
+        createdAt: created_at.toISOString(),
+        participants,
+        unreadCount: 0,
+      };
+    });
+  }
+
+  async addGroupMembers(
+    chatId: string,
+    requesterId: string,
+    userIds: string[],
+  ): Promise<GroupMemberUpdateResponse> {
+    const requesterRow = await this.db.query<{ role: string; chat_type: string }>(
+      `SELECT cp.role, c.type AS chat_type
+       FROM chat_participants cp
+       JOIN chats c ON c.id = cp.chat_id
+       WHERE cp.chat_id = $1 AND cp.user_id = $2`,
+      [chatId, requesterId],
+    );
+
+    if (requesterRow.rows.length === 0) {
+      throw new NotFoundException({ code: ErrorCode.CHAT_NOT_FOUND, message: 'Chat not found.' });
+    }
+    if (requesterRow.rows[0].chat_type !== 'group') {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION_ERROR, message: 'Not a group chat.' });
+    }
+    const role = requesterRow.rows[0].role;
+    if (role !== ParticipantRole.OWNER && role !== ParticipantRole.ADMIN) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'Only the owner or admin can add members.' });
+    }
+
+    const deduped = [...new Set(userIds)];
+    for (const uid of deduped) {
+      await this.db.query(
+        `INSERT INTO chat_participants (chat_id, user_id, role)
+         VALUES ($1, $2, 'member')
+         ON CONFLICT (chat_id, user_id) DO NOTHING`,
+        [chatId, uid],
+      );
+    }
+
+    const result = await this.db.query<{
+      user_id: string; role: string; joined_at: Date;
+      username: string; display_name: string; avatar_url: string | null;
+    }>(
+      `SELECT cp.user_id, cp.role, cp.joined_at, u.username, u.display_name, u.avatar_url
+       FROM chat_participants cp
+       JOIN users u ON u.id = cp.user_id
+       WHERE cp.chat_id = $1`,
+      [chatId],
+    );
+
+    const participants: ChatParticipantDTO[] = result.rows.map((r) => ({
+      chatId,
+      userId: r.user_id,
+      role: r.role as ParticipantRole,
+      joinedAt: r.joined_at.toISOString(),
+      user: {
+        id: r.user_id,
+        username: r.username,
+        displayName: r.display_name,
+        ...(r.avatar_url !== null && { avatarUrl: r.avatar_url }),
+      },
+    }));
+
+    return { chatId, participants };
+  }
+
+  async removeGroupMember(
+    chatId: string,
+    requesterId: string,
+    targetUserId: string,
+  ): Promise<RemoveGroupMemberResponse> {
+    const requesterRow = await this.db.query<{ role: string; chat_type: string }>(
+      `SELECT cp.role, c.type AS chat_type
+       FROM chat_participants cp
+       JOIN chats c ON c.id = cp.chat_id
+       WHERE cp.chat_id = $1 AND cp.user_id = $2`,
+      [chatId, requesterId],
+    );
+
+    if (requesterRow.rows.length === 0) {
+      throw new NotFoundException({ code: ErrorCode.CHAT_NOT_FOUND, message: 'Chat not found.' });
+    }
+    if (requesterRow.rows[0].chat_type !== 'group') {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION_ERROR, message: 'Not a group chat.' });
+    }
+
+    const requesterRole = requesterRow.rows[0].role;
+    const isSelf = requesterId === targetUserId;
+
+    if (!isSelf) {
+      if (requesterRole !== ParticipantRole.OWNER && requesterRole !== ParticipantRole.ADMIN) {
+        throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'Only the owner or admin can remove members.' });
+      }
+      // Cannot remove the owner
+      const targetRow = await this.db.query<{ role: string }>(
+        'SELECT role FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+        [chatId, targetUserId],
+      );
+      if (targetRow.rows[0]?.role === ParticipantRole.OWNER) {
+        throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'Cannot remove the group owner.' });
+      }
+    }
+
+    await this.db.query(
+      'DELETE FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+      [chatId, targetUserId],
+    );
+
+    return { chatId, userId: targetUserId };
+  }
+
+  async updateGroupChat(
+    chatId: string,
+    userId: string,
+    title: string,
+  ): Promise<UpdateGroupChatResponse> {
+    const row = await this.db.query<{ role: string; chat_type: string }>(
+      `SELECT cp.role, c.type AS chat_type
+       FROM chat_participants cp
+       JOIN chats c ON c.id = cp.chat_id
+       WHERE cp.chat_id = $1 AND cp.user_id = $2`,
+      [chatId, userId],
+    );
+
+    if (row.rows.length === 0) {
+      throw new NotFoundException({ code: ErrorCode.CHAT_NOT_FOUND, message: 'Chat not found.' });
+    }
+    if (row.rows[0].chat_type !== 'group') {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION_ERROR, message: 'Not a group chat.' });
+    }
+    const role = row.rows[0].role;
+    if (role !== ParticipantRole.OWNER && role !== ParticipantRole.ADMIN) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'Only the owner or admin can rename the group.' });
+    }
+
+    const trimmed = title.trim();
+    await this.db.query(
+      'UPDATE chats SET title = $1, updated_at = NOW() WHERE id = $2',
+      [trimmed, chatId],
+    );
+
+    return { chatId, title: trimmed };
+  }
+
   async deleteChatForMe(chatId: string, userId: string): Promise<DeleteChatForMeResponse> {
     const memberCheck = await this.db.query(
       'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
@@ -324,7 +567,7 @@ export class ChatsService {
       INSERT INTO chat_deletions (chat_id, user_id)
       VALUES ($1, $2)
       ON CONFLICT (chat_id, user_id) DO UPDATE
-        SET deleted_at = chat_deletions.deleted_at
+        SET deleted_at = NOW()
       RETURNING deleted_at
     `, [chatId, userId]);
 

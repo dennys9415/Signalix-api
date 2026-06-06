@@ -1,8 +1,8 @@
 # Signalix API
 
-**Version: v0.2.0**
+**Version: v0.5.0**
 
-NestJS REST API for Signalix. Handles authentication, user management, chats, messages, presence, and transactional email.
+NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, and transactional email.
 
 ## Stack
 
@@ -11,6 +11,7 @@ NestJS REST API for Signalix. Handles authentication, user management, chats, me
 - **Flyway** — SQL migrations in `migrations/`
 - **JWT** — access token (1 h), refresh token (30 d, max 5 active devices per user)
 - **Resend** — transactional email for password reset and email verification
+- **S3-compatible storage** (via `@aws-sdk/client-s3`) — avatars, image messages, file attachments
 - **`@signalix/contracts`** — single source of truth for all DTOs and enums
 
 ## Architecture
@@ -69,6 +70,14 @@ Edit `.env`:
 | `APPLE_CALLBACK_URL` | OAuth | **Must be HTTPS** — Apple rejects `http://` |
 | `RESEND_API_KEY` | Email | Leave empty to skip sending and log URLs to console |
 | `EMAIL_FROM` | no | Default `Signalix <onboarding@resend.dev>` |
+| `MINIO_ENDPOINT` | **yes** | Internal S3 endpoint reachable by the API process (Docker: `http://minio:9000`) |
+| `MINIO_PUBLIC_URL` | **yes** | Externally reachable URL baked into stored avatar / media URLs |
+| `MINIO_REGION` | no | Default `us-east-1` |
+| `MINIO_ACCESS_KEY` | **yes** | MinIO access key |
+| `MINIO_SECRET_KEY` | **yes** | MinIO secret key |
+| `MINIO_BUCKET_AVATARS` | no | Default `signalix-avatars` |
+| `MINIO_BUCKET_MEDIA` | no | Default `signalix-media` (image messages) |
+| `MINIO_BUCKET_FILES` | no | Default `signalix-files` (file attachments) |
 
 > **Apple callback URL:** Apple does not permit plain HTTP redirect URIs. Use a tunnel (e.g. ngrok) for local development.
 >
@@ -120,6 +129,11 @@ flyway \
 | `V4__message_deletions.sql` | `message_deletions` for delete-for-me |
 | `V5__password_reset.sql` | `password_reset_tokens` |
 | `V6__email_verification.sql` | `email_verification_tokens` |
+| `V7__chat_deletions.sql` | `chat_deletions` — per-user visibility cutoff for chat history |
+| `V8__message_reactions.sql` | `message_reactions` — emoji reactions |
+| `V9__message_reply_forward.sql` | `reply_to_message_id` + `is_forwarded` on `messages` |
+| `V10__link_preview.sql` | `link_preview` JSONB column on `messages` |
+| `V11__read_state.sql` | `chat_read_state` — persistent unread counters per chat per user |
 
 Never edit a deployed migration file — always add a new one.
 
@@ -153,20 +167,45 @@ All routes are prefixed `/api/v1`.
 | GET | `/users/search?q=&limit=` | Partial case-insensitive username search; max 25 results |
 | GET | `/users/lookup/:username` | Exact username match |
 
+### Profile (JWT required)
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/profile/avatar` | `multipart/form-data` upload; returns updated `UserDTO` |
+| DELETE | `/profile/avatar` | Removes the avatar; returns updated `UserDTO` |
+
 ### Chats (JWT required)
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/chats` | All chats for the current user |
-| GET | `/chats/:chatId/messages` | Paginated (newest-first). Query: `limit`, `cursor` |
+| GET | `/chats` | All chats for the current user (direct + group) |
+| GET | `/chats/:chatId/messages` | Paginated (newest-first). Query: `limit`, `cursor`. Filters by `chat_deletions.deleted_at` for the caller. |
+| POST | `/chats/:chatId/read` | Marks chat as read; clears persistent unread counter |
+| POST | `/chats/:chatId/delete-for-me` | Sets `chat_deletions.deleted_at` cutoff for the caller |
+| POST | `/chats/group` | `{ title, memberIds }` — creates a group chat |
+| PATCH | `/chats/:chatId` | `{ title }` — renames a group chat (owner only) |
+| POST | `/chats/:chatId/members` | `{ userIds }` — adds group members (owner only) |
+| DELETE | `/chats/:chatId/members/:userId` | Removes member or self-leaves the group |
 
 ### Messages (JWT required)
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/messages/send` | `{ chatId?, recipientUsername?, ciphertext, messageType }` |
+| POST | `/messages/send` | `{ chatId?, recipientUsername?, ciphertext, messageType, replyToMessageId?, isForwarded? }` |
 | POST | `/messages/:messageId/status` | `{ status: delivered\|read }` |
 | POST | `/messages/:messageId/delete-for-me` | Soft-deletes the message for the caller only |
+| POST | `/messages/:messageId/delete-for-everyone` | Marks message as deleted for all participants |
+| PATCH | `/messages/:messageId` | `{ ciphertext }` — edits a text message (sender only) |
+| POST | `/messages/:messageId/reaction` | `{ emoji }` — sets/replaces the caller's reaction |
+| DELETE | `/messages/:messageId/reaction` | Removes the caller's reaction |
+
+### Files & media (JWT required)
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/files/upload` | `multipart/form-data` — uploads a file attachment; returns metadata used in `ciphertext` for `MessageType.FILE` |
+| GET | `/files/:messageId/download` | Streams the attachment back; authorization checked against chat participants |
+| POST | `/media/upload` | `multipart/form-data` — uploads an image; returns URL used in `ciphertext` for `MessageType.IMAGE` |
 
 ### Presence (JWT required)
 
@@ -203,15 +242,28 @@ src/
     users.controller.ts        # me, search, lookup endpoints
     users.service.ts
     dto/
+  profile/
+    profile.controller.ts      # Avatar upload / remove
+    profile.service.ts
   chats/
-    chats.controller.ts        # List chats, message history
-    ...
+    chats.controller.ts        # List chats, message history, group create/rename/members, delete-for-me, mark-read
+    chats.service.ts
   messages/
-    messages.controller.ts     # Send, status update, delete-for-me
-    ...
+    messages.controller.ts     # Send, status update, delete-for-me, delete-for-everyone, edit, reactions
+    messages.service.ts
+  files/
+    files.controller.ts        # File attachment upload + download
+    files.service.ts
+  media/
+    media.controller.ts        # Image upload
+    media.service.ts
+  link-preview/
+    link-preview.service.ts    # Server-side OG/Twitter metadata fetch
+  storage/
+    storage.service.ts         # S3-compatible client wrapper
   presence/
     presence.controller.ts     # Lookup, status update
-    ...
+    presence.service.ts
 migrations/
   V1__init.sql
   V2__auth.sql
@@ -219,6 +271,11 @@ migrations/
   V4__message_deletions.sql
   V5__password_reset.sql
   V6__email_verification.sql
+  V7__chat_deletions.sql
+  V8__message_reactions.sql
+  V9__message_reply_forward.sql
+  V10__link_preview.sql
+  V11__read_state.sql
 ```
 
 ## Docker
@@ -232,38 +289,40 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
 
-## v0.2.0 changelog
+## v0.5.0 changelog
 
-### Added
-- **Google OAuth** — `GET /auth/google` + `GET /auth/google/callback`
-- **GitHub OAuth** — `GET /auth/github` + `GET /auth/github/callback`; private email fallback via `GET /user/emails`
-- **Apple OAuth** — `GET /auth/apple` + `POST /auth/apple/callback` (form_post); ES256 client secret via `@nestjs/jwt`
-- **Password reset** — `POST /auth/forgot-password` + `POST /auth/reset-password`; 32-byte random token, SHA-256 hash stored, 15-min TTL
-- **Email verification** — `POST /auth/verify-email` + `POST /auth/resend-verification`; 32-byte random token, SHA-256 hash stored, 24-hour TTL; new local registrations start as unverified
-- **Resend email integration** — `EmailService` with `sendPasswordReset` and `sendEmailVerification`; graceful fallback to console log when `RESEND_API_KEY` is absent
-- **Partial username search** — `GET /users/search?q=&limit=`; case-insensitive `ILIKE` contains match, excludes caller
-- **Delete for me** — `POST /messages/:messageId/delete-for-me`; stored in `message_deletions`; excluded from history for the requesting user
-- **User profile endpoint** — `GET /users/me`; returns user fields + list of connected OAuth providers
-- **Display name** — `display_name` surface exposed through `UserDTO`
+### Added since v0.2.0
+- **Group chats** — `POST /chats/group`, `PATCH /chats/:chatId` (rename), `POST /chats/:chatId/members` (add), `DELETE /chats/:chatId/members/:userId` (remove or self-leave); owner role enforced
+- **Delete chat for me** — `POST /chats/:chatId/delete-for-me`; stored in `chat_deletions`; `getMessages()` filters by visibility cutoff
+- **Mark chat as read** — `POST /chats/:chatId/read`; persistent unread counters via `chat_read_state`
+- **Edit message** — `PATCH /messages/:messageId` (text only, sender only); emits `server.message.edited`
+- **Delete for everyone** — `POST /messages/:messageId/delete-for-everyone`; placeholder shown for all participants; emits `server.message.deleted_for_everyone`
+- **Reactions** — `POST /messages/:messageId/reaction` + `DELETE /messages/:messageId/reaction`; one reaction per user per message; emits `server.message.reaction_updated`
+- **Reply / Forward** — `replyToMessageId` and `isForwarded` accepted on send; embedded `ReplyPreviewDTO` returned on reads
+- **Link previews** — `LinkPreviewService` extracts OG/Twitter metadata on first send; stored as JSONB
+- **Avatar upload** — `POST /profile/avatar` and `DELETE /profile/avatar` (S3-backed via `StorageService`)
+- **Image messages** — `POST /media/upload`; `ciphertext` carries the public URL with `messageType: IMAGE`
+- **File attachments** — `POST /files/upload` + `GET /files/:messageId/download`; `ciphertext` carries `{ url, name, size }` JSON with `messageType: FILE`
 
-### Fixed
-- OAuth link case: linking a provider to an existing unverified local account now sets `is_verified = true`
+### v0.5.0 stabilization
+- New users now receive `avatarUrl: null` (no provider-default fallback)
+- Old messages no longer reappear after delete-and-restart of a direct chat — `chat_deletions.deleted_at` is updated to `NOW()` on re-delete and `messages.service.ts` no longer clears `chat_deletions` for other participants
+- Direct chat reopen now matches `ChatType.DIRECT` only — group chats can no longer be reopened by username
+- First message sent from a draft chat carries only `recipientUsername` (no client-side `draft:<id>` chatId), so realtime correctly creates the chat and delivers `server.message.new` to the recipient
 
 ## Known limitations
 
 - **No email required for login blocking** — users with `is_verified = false` can still log in. Blocking unverified logins is a future policy decision.
 - **Max 5 active devices per user** — oldest device session is evicted on the 6th login.
 - **`ciphertext` stored as plain text** — Signal Protocol is not implemented.
-- **No group chats** — `ChatType.DIRECT` only.
-- **No media uploads** — text messages only.
 - **No push notifications** — delivery requires an active WebSocket connection.
+- **Group read receipts collapsed** — only one `READ` state per message (no per-participant matrix yet).
 - **Apple callback must be HTTPS** — plain HTTP is rejected by Apple.
 
 ## Planned
 
 - Block login for unverified email (configurable)
-- Message edit (`PUT /messages/:id`)
-- Delete for everyone
-- Group chats
-- Media uploads
+- Per-participant read receipts in group chats
 - Push notification delivery
+- Search inside conversations
+- Signal Protocol / E2EE

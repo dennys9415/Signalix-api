@@ -63,6 +63,5 @@ throw new ConflictException({ code: ErrorCode.USERNAME_TAKEN, message: '...' });
 - Media uploads
 - Real E2EE / Signal Protocol
 - Push notifications
-- Group chats
 - Advanced multi-device sync
 - Redis / Kafka / NATS

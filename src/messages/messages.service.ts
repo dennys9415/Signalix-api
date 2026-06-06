@@ -150,11 +150,6 @@ export class MessagesService {
         [chatId],
       );
 
-      // Reappearance: clear any personal chat deletions so the chat resurfaces for everyone
-      await client.query(
-        'DELETE FROM chat_deletions WHERE chat_id = $1',
-        [chatId],
-      );
 
       const message: MessageDTO = {
         id: msgId,

@@ -476,7 +476,7 @@ export class AuthService {
             email,
             username,
             profile.name ?? username,
-            profile.picture ?? null,
+            null,
           ]);
 
           userId = inserted.rows[0].id;
@@ -612,7 +612,7 @@ export class AuthService {
             email,
             username,
             profile.name ?? username,
-            profile.avatar_url ?? null,
+            null,
           ]);
 
           userId = inserted.rows[0].id;
