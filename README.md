@@ -1,10 +1,10 @@
 # Signalix API
 
-**Version: v0.8.0**
+**Version: v0.9.0**
 
-NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, and (v0.8.0) the **encryption foundation** — device key registration, signed pre-keys, one-time pre-keys, and key-bundle lookup.
+NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, the v0.8.0 crypto foundation, and (v0.9.0) **real beta E2EE for direct text messages** — `messages.ciphertext` for those rows now carries an opaque ECDH+AES-GCM envelope written by v0.9.0 clients.
 
-> ⚠️ **v0.8.0 is the encryption *foundation*, not real E2EE.** The crypto endpoints store and serve key material, and `messages` gained five envelope columns, but message bodies are still received and persisted as plaintext in `ciphertext`. **No signature verification yet.** v0.9.0 is the planned E2EE beta. See `## v0.8.0 changelog` below for the loud version.
+> ⚠️ **Beta E2EE — not production-grade.** v0.9.0 turns on direct-text E2EE between v0.9.0+ clients. The API stores opaque ciphertext for those rows; everything else (groups, images, files, voice notes) still flows as plaintext. No signature verification on signed pre-keys yet, no Double Ratchet, single-device assumption. **v0.10.0** hardens this; v0.11.0+ extends to groups + media.
 
 ## Stack
 
@@ -334,6 +334,19 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 ```
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
+
+## v0.9.0 changelog — Signal Protocol Beta backend bits
+
+> ⚠️ **Beta E2EE.** v0.9.0 turns on real end-to-end encryption for direct text messages between v0.9.0 clients. The API stores opaque ciphertext for these rows; everything else (groups, images, files, voice notes) still flows as plaintext. **No signature verification yet** on signed pre-keys — that's v0.10.0.
+
+### Not changed
+- All v0.8.0 crypto endpoints (`POST /crypto/devices/keys`, `PATCH …/signed-pre-key`, `POST …/pre-keys`, `GET /crypto/users/:userId/key-bundle`) are unchanged. The v0.9.0 frontend simply starts calling them at login.
+- `SendMessageDto` already accepts the envelope fields since v0.8.0. The frontend now populates them; the API persists them as before.
+- `chats.service.getMessages` already SELECTs the envelope columns; the API now returns encrypted ciphertext for direct TEXT rows where v0.9.0+ clients wrote them. v0.8.0 clients see opaque ciphertext but the server doesn't care.
+
+### Operational notes
+- **`messages.ciphertext` is no longer guaranteed to be plaintext** for rows where `encryption_version >= 1`. Anything reading from the DB (analytics, search indexers, future tooling) needs to gate on `encryption_version` before assuming readable text. The existing global + in-chat search endpoints continue to ILIKE the raw column — encrypted rows simply won't match a plaintext query, which is the desired behaviour (the server doesn't see the words anyway).
+- **Push notification preview** for an encrypted message reads the encrypted ciphertext blob. Recipients see a non-useful preview unless we change the preview path to a generic "New message". For v0.9.0 beta we leave the existing previewer; v0.10.0 will route encrypted messages through a "New encrypted message" generic body.
 
 ## v0.8.0 changelog
 
