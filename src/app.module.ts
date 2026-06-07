@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from './auth/auth.module';
 import { ChatsModule } from './chats/chats.module';
 import { ConfigModule } from './config/config.module';
+import { CryptoModule } from './crypto/crypto.module';
 import { DbModule } from './db/db.module';
 import { FilesModule } from './files/files.module';
 import { LinkPreviewModule } from './link-preview/link-preview.module';
@@ -13,6 +14,6 @@ import { PushModule } from './push/push.module';
 import { UsersModule } from './users/users.module';
 
 @Module({
-  imports: [ConfigModule, DbModule, AuthModule, UsersModule, ChatsModule, MessagesModule, PresenceModule, ProfileModule, MediaModule, FilesModule, LinkPreviewModule, PushModule],
+  imports: [ConfigModule, DbModule, AuthModule, UsersModule, ChatsModule, MessagesModule, PresenceModule, ProfileModule, MediaModule, FilesModule, LinkPreviewModule, PushModule, CryptoModule],
 })
 export class AppModule {}

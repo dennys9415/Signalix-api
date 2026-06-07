@@ -143,10 +143,25 @@ export class MessagesService {
       const msgId = randomUUID();
       const now = new Date();
 
+      // Encryption envelope columns are accepted but optional. In v0.8.0 the
+      // frontend's crypto layer always passes `encryptionVersion: 0` (or
+      // omits it) so existing chats keep flowing as plaintext.
+      const envelopeVersion = dto.encryptionVersion ?? 0;
       await client.query(`
-        INSERT INTO messages (id, chat_id, sender_id, ciphertext, message_type, reply_to, is_forwarded)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-      `, [msgId, chatId, senderId, dto.ciphertext, dto.messageType, dto.replyToMessageId ?? null, dto.isForwarded ?? false]);
+        INSERT INTO messages (
+          id, chat_id, sender_id, ciphertext, message_type, reply_to, is_forwarded,
+          encryption_version, sender_device_id, recipient_device_id, pre_key_id, signed_pre_key_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `, [
+        msgId, chatId, senderId, dto.ciphertext, dto.messageType,
+        dto.replyToMessageId ?? null, dto.isForwarded ?? false,
+        envelopeVersion,
+        dto.senderDeviceId ?? null,
+        dto.recipientDeviceId ?? null,
+        dto.preKeyId ?? null,
+        dto.signedPreKeyId ?? null,
+      ]);
 
       await client.query(
         'INSERT INTO message_status (message_id, user_id, status) VALUES ($1, $2, $3)',
@@ -169,6 +184,11 @@ export class MessagesService {
         createdAt: now.toISOString(),
         ...(replyTo && { replyTo }),
         ...(dto.isForwarded && { isForwarded: true }),
+        ...(envelopeVersion > 0 && { encryptionVersion: envelopeVersion }),
+        ...(dto.senderDeviceId !== undefined && { senderDeviceId: dto.senderDeviceId }),
+        ...(dto.recipientDeviceId !== undefined && { recipientDeviceId: dto.recipientDeviceId }),
+        ...(dto.preKeyId !== undefined && { preKeyId: dto.preKeyId }),
+        ...(dto.signedPreKeyId !== undefined && { signedPreKeyId: dto.signedPreKeyId }),
       };
 
       return {

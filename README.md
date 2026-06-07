@@ -1,8 +1,10 @@
 # Signalix API
 
-**Version: v0.7.1**
+**Version: v0.8.0**
 
-NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, and Web Push delivery.
+NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, and (v0.8.0) the **encryption foundation** — device key registration, signed pre-keys, one-time pre-keys, and key-bundle lookup.
+
+> ⚠️ **v0.8.0 is the encryption *foundation*, not real E2EE.** The crypto endpoints store and serve key material, and `messages` gained five envelope columns, but message bodies are still received and persisted as plaintext in `ciphertext`. **No signature verification yet.** v0.9.0 is the planned E2EE beta. See `## v0.8.0 changelog` below for the loud version.
 
 ## Stack
 
@@ -139,6 +141,7 @@ flyway \
 | `V11__read_state.sql` | `chat_read_state` — persistent unread counters per chat per user |
 | `V12__push_subscriptions.sql` | `push_subscriptions` — one row per (user, browser endpoint) for Web Push |
 | `V13__chats_avatar_description.sql` | `chats.avatar_url` + `chats.description` — group avatar URL (MinIO public URL) and editable group description (max 500 chars enforced by API DTO) |
+| `V14__crypto_foundation.sql` | `device_identity_keys`, `signed_pre_keys`, `pre_keys` + `messages.encryption_version` / `sender_device_id` / `recipient_device_id` / `pre_key_id` / `signed_pre_key_id`. **Scaffolding only** — no encryption is performed in v0.8.0. |
 
 Never edit a deployed migration file — always add a new one.
 
@@ -218,6 +221,19 @@ All routes are prefixed `/api/v1`.
 | POST | `/media/upload` | `multipart/form-data` — uploads an image; returns URL used in `ciphertext` for `MessageType.IMAGE` |
 | POST | `/media/voice` | `multipart/form-data` (field `audio`) — uploads a voice note (audio/webm, /ogg, /mp4, /aac, /x-m4a, /mpeg, /wav); returns `{ voiceUrl }` baked into `ciphertext` for `MessageType.AUDIO`. Max 10 MB. |
 
+### Crypto foundation (v0.8.0)
+
+> **Important.** v0.8.0 ships scaffolding for a future Signal-Protocol-style E2EE layer. The endpoints below accept and serve key material, but **no messages are actually encrypted yet** — the `messages.ciphertext` column still carries plaintext. v0.9.0 is the planned beta for real E2EE.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/crypto/devices/keys` | JWT | Initial publish of a device's identity / signing / signed-pre-key / one-time pre-key batch. Idempotent (upsert on identity, ON CONFLICT DO NOTHING on key rows). DeviceId is taken from the JWT, never from the body. |
+| PATCH | `/crypto/devices/keys/signed-pre-key` | JWT | Periodic rotation of the device's signed pre-key. Marks the prior signed pre-key as `rotated_at = NOW()` (kept around for in-flight handshakes). |
+| POST | `/crypto/devices/keys/pre-keys` | JWT | Top up the one-time pre-key pool after several have been consumed. Returns the new unconsumed count. |
+| GET | `/crypto/users/:userId/key-bundle` | JWT | Fetch every device bundle for a user. Atomically claims one unconsumed one-time pre-key per device (`FOR UPDATE SKIP LOCKED`); falls back to signed-pre-key-only when the pool is exhausted. |
+
+All key material is exchanged as **base64url** strings on the wire; the API decodes once on publish and re-encodes on lookup. PostgreSQL stores raw `BYTEA`.
+
 ### Web Push (v0.6.0)
 
 | Method | Path | Auth | Description |
@@ -288,6 +304,9 @@ src/
   push/
     push.controller.ts         # GET /push/public-key, POST /push/subscribe, DELETE /push/unsubscribe
     push.service.ts            # web-push dispatch + stale-subscription cleanup
+  crypto/
+    crypto.controller.ts       # POST /crypto/devices/keys, PATCH .../signed-pre-key, POST .../pre-keys, GET /crypto/users/:userId/key-bundle
+    crypto.service.ts          # base64url ↔ BYTEA, atomic prekey claim, rotation
 migrations/
   V1__init.sql
   V2__auth.sql
@@ -301,6 +320,8 @@ migrations/
   V10__link_preview.sql
   V11__read_state.sql
   V12__push_subscriptions.sql
+  V13__chats_avatar_description.sql
+  V14__crypto_foundation.sql
 ```
 
 ## Docker
@@ -313,6 +334,25 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 ```
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
+
+## v0.8.0 changelog
+
+### Added — Encryption foundation (NOT real E2EE yet)
+
+> **Scope:** v0.8.0 wires the storage + transport + types for a future Signal-Protocol-style E2EE rollout. The server still receives and persists plaintext bodies in `messages.ciphertext`. The frontend's crypto layer is a passthrough mock. **v0.9.0 will be the real E2EE beta.**
+
+- **Migration `V14__crypto_foundation.sql`**:
+  - `device_identity_keys(device_id, registration_id, identity_key, signing_key, key_algorithm, registered_at, updated_at)` — one row per device, long-term identity. Upsert on register.
+  - `signed_pre_keys(device_id, key_id, public_key, signature, key_algorithm, created_at, rotated_at)` — rotated periodically; prior rows kept for late handshakes with `rotated_at` set. Partial index `WHERE rotated_at IS NULL`.
+  - `pre_keys(device_id, key_id, public_key, key_algorithm, created_at, consumed_at)` — one-time bundle, consumed atomically by `GET /key-bundle`. Partial index on unconsumed rows.
+  - `messages` gets 5 envelope columns: `encryption_version INTEGER NOT NULL DEFAULT 0`, `sender_device_id UUID`, `recipient_device_id UUID`, `pre_key_id INTEGER`, `signed_pre_key_id INTEGER`. All optional; defaults preserve the v0.7.x plaintext flow.
+- **`CryptoModule`** (`controller` + `service` + DTOs). Four endpoints under `/api/v1/crypto/*`. DeviceId is always taken from the JWT, never the body. All wire payloads use **base64url**; server decodes to BYTEA on persist.
+- **`SendMessageDto` widened** with optional envelope fields (validated with `class-validator`). `ChatsService.getMessages` SELECT includes the new columns; `MessagesService.sendMessage` INSERTs them when provided.
+- **`MessageDTO`**, **`SendMessageRequest`**, **`ClientMessageSendPayload`**, **`ServerMessageNewPayload`** all gain optional encryption-envelope fields in `Signalix-contracts`. v0.7.x clients keep working unchanged.
+
+### Not changed
+- Direct chats, group chats, media, files, voice notes, reactions, replies, forwards, edit, delete, search, push — **all continue to work as v0.7.x**. The new schema columns default to plaintext / NULL for every existing row.
+- Realtime service — no new events; the new envelope fields ride on the existing `client.message.send` / `server.message.new` payloads as additive optional properties.
 
 ## v0.7.1 changelog
 

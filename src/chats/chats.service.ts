@@ -65,6 +65,13 @@ interface MessageRow {
   // pg auto-parses json columns
   reactions_raw: Array<{ emoji: string; user_id: string }> | null;
   link_preview: Record<string, unknown> | null;
+  // v0.8.0 encryption envelope columns. encryption_version is NOT NULL
+  // (default 0) so it always comes back as an integer.
+  encryption_version: number;
+  sender_device_id: string | null;
+  recipient_device_id: string | null;
+  pre_key_id: number | null;
+  signed_pre_key_id: number | null;
 }
 
 @Injectable()
@@ -285,6 +292,11 @@ export class ChatsService {
         m.deleted_at,
         m.is_forwarded,
         m.link_preview,
+        m.encryption_version,
+        m.sender_device_id,
+        m.recipient_device_id,
+        m.pre_key_id,
+        m.signed_pre_key_id,
         m.reply_to       AS reply_to_id,
         rm.sender_id     AS reply_sender_id,
         rm.ciphertext    AS reply_ciphertext,
@@ -334,6 +346,13 @@ export class ChatsService {
         ...(replyTo && !isDeletedForEveryone && { replyTo }),
         ...(row.is_forwarded && { isForwarded: true }),
         ...(row.link_preview && !isDeletedForEveryone && { linkPreview: row.link_preview as unknown as LinkPreviewDTO }),
+        // Encryption envelope (v0.8.0). Only attached when non-default so
+        // plaintext rows stay clean in the JSON.
+        ...(row.encryption_version > 0 && { encryptionVersion: row.encryption_version }),
+        ...(row.sender_device_id !== null && { senderDeviceId: row.sender_device_id }),
+        ...(row.recipient_device_id !== null && { recipientDeviceId: row.recipient_device_id }),
+        ...(row.pre_key_id !== null && { preKeyId: row.pre_key_id }),
+        ...(row.signed_pre_key_id !== null && { signedPreKeyId: row.signed_pre_key_id }),
       };
     });
 
