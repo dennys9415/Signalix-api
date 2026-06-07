@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import {
+  ChatType,
   DeleteMessageForEveryoneResponse,
   DeleteMessageForMeResponse,
   EditMessageResponse,
@@ -14,11 +15,13 @@ import {
   MessageDTO,
   MessageLifecycleState,
   MessageReactionDTO,
+  MessageSearchResultDTO,
   MessageStatus,
   MessageStatusDTO,
   MessageType,
   ReactionResponse,
   ReplyPreviewDTO,
+  SearchMessagesResponse,
   SendMessageResponse,
 } from '@signalix/contracts';
 import { DbService } from '../db/db.service';
@@ -556,6 +559,140 @@ export class MessagesService {
 
     const reactions = await this.getReactionsForMessage(messageId);
     return { messageId, chatId, reactions };
+  }
+
+  /**
+   * Case-insensitive substring search over the caller's accessible TEXT
+   * messages. Honours per-user message deletions and chat-level visibility
+   * cutoffs. Keyset paginates by `created_at DESC`; cursor is base64(ISO).
+   */
+  async searchMessages(
+    userId: string,
+    q: string,
+    limit: number,
+    cursor: string | undefined,
+  ): Promise<SearchMessagesResponse> {
+    // Escape LIKE metacharacters in user input so a query like "50%" doesn't
+    // become a wildcard. The ESCAPE clause on the SQL side pairs with this.
+    const escaped = q.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+    const pattern = `%${escaped}%`;
+
+    let beforeTs: string | undefined;
+    if (cursor) {
+      try {
+        beforeTs = Buffer.from(cursor, 'base64').toString('utf-8');
+      } catch {
+        beforeTs = undefined;
+      }
+    }
+
+    const params: unknown[] = [userId, pattern];
+    let idx = 3;
+    let cursorClause = '';
+    if (beforeTs) {
+      cursorClause = `AND m.created_at < $${idx}::timestamptz`;
+      params.push(beforeTs);
+      idx += 1;
+    }
+    params.push(limit + 1);
+
+    interface Row {
+      message_id: string;
+      chat_id: string;
+      chat_type: string;
+      chat_label: string | null;
+      chat_avatar_url: string | null;
+      sender_id: string;
+      sender_display_name: string | null;
+      sender_username: string;
+      sender_avatar_url: string | null;
+      ciphertext: string;
+      created_at: Date;
+    }
+
+    const result = await this.db.query<Row>(
+      `
+      SELECT
+        m.id          AS message_id,
+        m.chat_id,
+        c.type        AS chat_type,
+        CASE
+          WHEN c.type = 'group' THEN c.title
+          ELSE COALESCE(other_user.display_name, other_user.username)
+        END AS chat_label,
+        CASE
+          WHEN c.type = 'group' THEN c.avatar_url
+          ELSE other_user.avatar_url
+        END AS chat_avatar_url,
+        m.sender_id,
+        sender.display_name AS sender_display_name,
+        sender.username     AS sender_username,
+        sender.avatar_url   AS sender_avatar_url,
+        LEFT(m.ciphertext, 280) AS ciphertext,
+        m.created_at
+      FROM messages m
+      JOIN chats c       ON c.id = m.chat_id
+      JOIN users sender  ON sender.id = m.sender_id
+      LEFT JOIN LATERAL (
+        SELECT u.display_name, u.username, u.avatar_url
+        FROM chat_participants cp
+        JOIN users u ON u.id = cp.user_id
+        WHERE cp.chat_id = c.id AND cp.user_id <> $1
+        LIMIT 1
+      ) other_user ON c.type = 'direct'
+      WHERE m.message_type = 'text'
+        AND m.deleted_at IS NULL
+        AND m.ciphertext ILIKE $2 ESCAPE '\\'
+        AND EXISTS (
+          SELECT 1 FROM chat_participants cp
+          WHERE cp.chat_id = m.chat_id AND cp.user_id = $1
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM message_deletions md
+          WHERE md.message_id = m.id AND md.user_id = $1
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM chat_deletions cd
+          WHERE cd.chat_id = m.chat_id
+            AND cd.user_id = $1
+            AND m.created_at <= cd.deleted_at
+        )
+        ${cursorClause}
+      ORDER BY m.created_at DESC
+      LIMIT $${idx}
+      `,
+      params,
+    );
+
+    const hasMore = result.rows.length > limit;
+    const page = hasMore ? result.rows.slice(0, limit) : result.rows;
+
+    const results: MessageSearchResultDTO[] = page.map((row) => ({
+      messageId: row.message_id,
+      chatId: row.chat_id,
+      chatType: row.chat_type as ChatType,
+      chatLabel: row.chat_label ?? '',
+      ...(row.chat_avatar_url !== null && { chatAvatarUrl: row.chat_avatar_url }),
+      senderId: row.sender_id,
+      senderName: row.sender_display_name ?? row.sender_username,
+      ...(row.sender_avatar_url !== null && { senderAvatarUrl: row.sender_avatar_url }),
+      ciphertext: row.ciphertext,
+      createdAt: row.created_at.toISOString(),
+    }));
+
+    const lastRow = page[page.length - 1];
+    const nextCursor =
+      hasMore && lastRow
+        ? Buffer.from(lastRow.created_at.toISOString()).toString('base64')
+        : undefined;
+
+    return {
+      results,
+      pagination: {
+        hasMore,
+        ...(nextCursor !== undefined && { nextCursor }),
+      },
+    };
   }
 
   private async getReactionsForMessage(messageId: string): Promise<MessageReactionDTO[]> {

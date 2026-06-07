@@ -25,6 +25,7 @@ import type {
   GroupMemberUpdateResponse,
   MarkChatReadResponse,
   RemoveGroupMemberResponse,
+  SearchInChatResponse,
   TransferGroupOwnershipResponse,
   UpdateGroupChatResponse,
 } from '@signalix/contracts';
@@ -37,6 +38,7 @@ import { CreateGroupChatDto } from './dto/create-group-chat.dto';
 import { AddGroupMembersDto } from './dto/add-group-members.dto';
 import { UpdateGroupChatDto } from './dto/update-group-chat.dto';
 import { TransferOwnershipDto } from './dto/transfer-ownership.dto';
+import { SearchInChatDto } from './dto/search-in-chat.dto';
 import { ChatsService } from './chats.service';
 
 @Controller('chats')
@@ -60,6 +62,16 @@ export class ChatsController {
   ): Promise<ApiResponse<{ chats: ChatDTO[] }>> {
     const chats = await this.chatsService.getUserChats(user.sub);
     return ok({ chats });
+  }
+
+  @Get(':chatId/search')
+  async searchInChat(
+    @Param('chatId') chatId: string,
+    @CurrentUser() user: JwtPayload,
+    @Query() query: SearchInChatDto,
+  ): Promise<ApiResponse<SearchInChatResponse>> {
+    const result = await this.chatsService.searchInChat(chatId, user.sub, query.q, query.limit, query.cursor);
+    return ok(result);
   }
 
   @Get(':chatId/messages')

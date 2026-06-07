@@ -9,6 +9,7 @@ import {
   ErrorCode,
   GroupAvatarUploadResponse,
   GroupMemberUpdateResponse,
+  InChatSearchMatchDTO,
   LinkPreviewDTO,
   MarkChatReadResponse,
   MessageDTO,
@@ -18,6 +19,7 @@ import {
   ParticipantRole,
   RemoveGroupMemberResponse,
   ReplyPreviewDTO,
+  SearchInChatResponse,
   TransferGroupOwnershipResponse,
   UpdateGroupChatRequest,
   UpdateGroupChatResponse,
@@ -715,6 +717,123 @@ export class ChatsService {
         participants,
       };
     });
+  }
+
+  /**
+   * Search messages within a single chat. Honours participant access,
+   * per-user deletions and the chat_deletions cutoff. Matches against
+   * `ciphertext` for TEXT messages and against the JSON-stringified
+   * payload for FILE messages (the filename lives inside the JSON).
+   * Image and audio messages aren't searchable — their ciphertext is a
+   * URL or `{url, duration}` blob with no user-facing string.
+   */
+  async searchInChat(
+    chatId: string,
+    userId: string,
+    q: string,
+    limit: number,
+    cursor: string | undefined,
+  ): Promise<SearchInChatResponse> {
+    const memberCheck = await this.db.query(
+      'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+      [chatId, userId],
+    );
+    if (memberCheck.rows.length === 0) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Not a participant in this chat.',
+      });
+    }
+
+    // Escape LIKE metacharacters so "50%" doesn't become a wildcard.
+    const escaped = q.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+    const pattern = `%${escaped}%`;
+
+    let beforeTs: string | undefined;
+    if (cursor) {
+      try { beforeTs = Buffer.from(cursor, 'base64').toString('utf-8'); }
+      catch { beforeTs = undefined; }
+    }
+
+    const params: unknown[] = [chatId, userId, pattern];
+    let idx = 4;
+    let cursorClause = '';
+    if (beforeTs) {
+      cursorClause = `AND m.created_at < $${idx}::timestamptz`;
+      params.push(beforeTs);
+      idx += 1;
+    }
+    params.push(limit + 1);
+
+    interface Row {
+      id: string;
+      sender_id: string;
+      ciphertext: string;
+      message_type: string;
+      created_at: Date;
+      sender_display_name: string | null;
+      sender_username: string;
+    }
+
+    const result = await this.db.query<Row>(
+      `
+      SELECT
+        m.id,
+        m.sender_id,
+        LEFT(m.ciphertext, 280) AS ciphertext,
+        m.message_type,
+        m.created_at,
+        u.display_name AS sender_display_name,
+        u.username     AS sender_username
+      FROM messages m
+      JOIN users u ON u.id = m.sender_id
+      WHERE m.chat_id = $1
+        AND m.deleted_at IS NULL
+        AND m.message_type IN ('text', 'file')
+        AND m.ciphertext ILIKE $3 ESCAPE '\\'
+        AND NOT EXISTS (
+          SELECT 1 FROM message_deletions md
+          WHERE md.message_id = m.id AND md.user_id = $2
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM chat_deletions cd
+          WHERE cd.chat_id = $1
+            AND cd.user_id = $2
+            AND m.created_at <= cd.deleted_at
+        )
+        ${cursorClause}
+      ORDER BY m.created_at DESC
+      LIMIT $${idx}
+      `,
+      params,
+    );
+
+    const hasMore = result.rows.length > limit;
+    const page = hasMore ? result.rows.slice(0, limit) : result.rows;
+
+    const matches: InChatSearchMatchDTO[] = page.map((row) => ({
+      messageId: row.id,
+      senderId: row.sender_id,
+      senderName: row.sender_display_name ?? row.sender_username,
+      ciphertext: row.ciphertext,
+      messageType: row.message_type as MessageType,
+      createdAt: row.created_at.toISOString(),
+    }));
+
+    const lastRow = page[page.length - 1];
+    const nextCursor =
+      hasMore && lastRow
+        ? Buffer.from(lastRow.created_at.toISOString()).toString('base64')
+        : undefined;
+
+    return {
+      chatId,
+      matches,
+      pagination: {
+        hasMore,
+        ...(nextCursor !== undefined && { nextCursor }),
+      },
+    };
   }
 
   /**

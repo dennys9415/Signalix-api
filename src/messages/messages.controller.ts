@@ -2,11 +2,13 @@ import {
   Body,
   Controller,
   Delete,
+  Get,
   HttpCode,
   HttpStatus,
   Param,
   Patch,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import type {
@@ -16,6 +18,7 @@ import type {
   EditMessageResponse,
   MessageStatusDTO,
   ReactionResponse,
+  SearchMessagesResponse,
   SendMessageResponse,
 } from '@signalix/contracts';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
@@ -24,6 +27,7 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { ok } from '../common/response.helper';
 import { AddReactionDto } from './dto/add-reaction.dto';
 import { EditMessageDto } from './dto/edit-message.dto';
+import { SearchMessagesDto } from './dto/search-messages.dto';
 import { SendMessageDto } from './dto/send-message.dto';
 import { UpdateStatusDto } from './dto/update-status.dto';
 import { MessagesService } from './messages.service';
@@ -40,6 +44,20 @@ export class MessagesController {
     @CurrentUser() user: JwtPayload,
   ): Promise<ApiResponse<SendMessageResponse>> {
     const result = await this.messagesService.sendMessage(user.sub, dto);
+    return ok(result);
+  }
+
+  @Get('search')
+  async search(
+    @Query() query: SearchMessagesDto,
+    @CurrentUser() user: JwtPayload,
+  ): Promise<ApiResponse<SearchMessagesResponse>> {
+    const result = await this.messagesService.searchMessages(
+      user.sub,
+      query.q,
+      query.limit,
+      query.cursor,
+    );
     return ok(result);
   }
 

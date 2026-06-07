@@ -1,6 +1,6 @@
 # Signalix API
 
-**Version: v0.7.0**
+**Version: v0.7.1**
 
 NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, and Web Push delivery.
 
@@ -200,6 +200,8 @@ All routes are prefixed `/api/v1`.
 | Method | Path | Description |
 |---|---|---|
 | POST | `/messages/send` | `{ chatId?, recipientUsername?, ciphertext, messageType, replyToMessageId?, isForwarded? }` |
+| GET | `/messages/search?q=&limit=&cursor=` | ILIKE substring search over the caller's TEXT messages (≥2 chars, max 50/page). Returns `MessageSearchResultDTO[]` with chat label / avatar, sender, snippet, and keyset `nextCursor`. |
+| GET | `/chats/:chatId/search?q=&limit=&cursor=` | ILIKE substring search scoped to one chat. Participant-only. Matches TEXT bodies and FILE filenames (the JSON-stringified payload is substring-matched). Default `limit` 100 (max 200) since in-chat UX needs all matches at once for "X of Y" navigation. |
 | POST | `/messages/:messageId/status` | `{ status: delivered\|read }` |
 | POST | `/messages/:messageId/delete-for-me` | Soft-deletes the message for the caller only |
 | POST | `/messages/:messageId/delete-for-everyone` | Marks message as deleted for all participants |
@@ -311,6 +313,15 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 ```
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
+
+## v0.7.1 changelog
+
+### Added
+- **`GET /api/v1/messages/search?q=&limit=&cursor=`** — case-insensitive substring lookup over the caller's accessible TEXT messages. `q` is required (2–200 chars); `limit` defaults to 20 (max 50); `cursor` is the base64-ISO of the previous page's last row. Implementation: `messages.ciphertext ILIKE $pat ESCAPE '\\'`, joined against `chat_participants` for access control, with `message_deletions` and `chat_deletions.deleted_at` cutoffs applied. Cursor is keyset on `created_at DESC`. Returns `MessageSearchResultDTO[]` enriched with the chat label (group title or other participant's display name for direct chats), avatar URL, sender info, and a `ciphertext` already truncated server-side via `LEFT(..., 280)`.
+- **`GET /api/v1/chats/:chatId/search?q=&limit=&cursor=`** — same ILIKE machinery but scoped to a single chat. Participant-only. Matches `message_type IN ('text', 'file')` — the JSON-stringified FILE payload is substring-matched so filenames embedded inside the JSON are searchable without a JSON cast. Default `limit` 100 (max 200) so the in-chat UX has every match upfront for "X of Y" navigation. Returns `InChatSearchMatchDTO[]` (messageId, sender, ciphertext, messageType, createdAt) + keyset `nextCursor`.
+
+### Not changed
+- No new migration. No realtime or contracts breaks.
 
 ## v0.7.0 changelog
 
