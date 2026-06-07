@@ -9,9 +9,10 @@ import { MediaModule } from './media/media.module';
 import { MessagesModule } from './messages/messages.module';
 import { PresenceModule } from './presence/presence.module';
 import { ProfileModule } from './profile/profile.module';
+import { PushModule } from './push/push.module';
 import { UsersModule } from './users/users.module';
 
 @Module({
-  imports: [ConfigModule, DbModule, AuthModule, UsersModule, ChatsModule, MessagesModule, PresenceModule, ProfileModule, MediaModule, FilesModule, LinkPreviewModule],
+  imports: [ConfigModule, DbModule, AuthModule, UsersModule, ChatsModule, MessagesModule, PresenceModule, ProfileModule, MediaModule, FilesModule, LinkPreviewModule, PushModule],
 })
 export class AppModule {}

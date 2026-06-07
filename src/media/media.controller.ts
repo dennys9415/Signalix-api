@@ -21,4 +21,14 @@ export class MediaController {
     const mediaUrl = await this.media.uploadMedia(user.sub, file);
     return ok({ mediaUrl });
   }
+
+  @Post('voice')
+  @UseInterceptors(FileInterceptor('audio', { storage: memoryStorage() }))
+  async uploadVoice(
+    @CurrentUser() user: JwtPayload,
+    @UploadedFile() file: Express.Multer.File,
+  ): Promise<ApiResponse<{ voiceUrl: string }>> {
+    const voiceUrl = await this.media.uploadVoice(user.sub, file);
+    return ok({ voiceUrl });
+  }
 }

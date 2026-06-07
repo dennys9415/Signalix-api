@@ -123,4 +123,19 @@ export class ConfigService {
   get minioFilesBucket(): string {
     return this.require('MINIO_BUCKET_FILES', 'signalix-files');
   }
+
+  // VAPID — Web Push keys. Generated once via `npx web-push generate-vapid-keys`.
+  // Empty fallback lets the app boot without push configured; PushService will
+  // log and become a no-op rather than crash. Subject must be a mailto: or URL.
+  get vapidPublicKey(): string {
+    return this.require('VAPID_PUBLIC_KEY', '');
+  }
+
+  get vapidPrivateKey(): string {
+    return this.require('VAPID_PRIVATE_KEY', '');
+  }
+
+  get vapidSubject(): string {
+    return this.require('VAPID_SUBJECT', 'mailto:admin@signalix.local');
+  }
 }

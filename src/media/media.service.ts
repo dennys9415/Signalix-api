@@ -4,13 +4,29 @@ import { randomUUID } from 'crypto';
 import { ConfigService } from '../config/config.service';
 import { StorageService } from '../storage/storage.service';
 
-const ALLOWED_MIME = new Set([
+const ALLOWED_IMAGE_MIME = new Set([
   'image/jpeg',
   'image/jpg',
   'image/png',
   'image/webp',
   'image/gif',
 ]);
+
+// MediaRecorder emits webm/opus on Chrome/Edge/Firefox; Safari uses
+// audio/mp4 (AAC). audio/ogg, audio/mpeg, audio/wav, audio/x-m4a are
+// accepted defensively. iOS may report audio/x-m4a or audio/aac for
+// the same data; both map cleanly to .m4a.
+const ALLOWED_AUDIO_MIME = new Set([
+  'audio/webm',
+  'audio/ogg',
+  'audio/mp4',
+  'audio/aac',
+  'audio/x-m4a',
+  'audio/mpeg',
+  'audio/wav',
+  'audio/x-wav',
+]);
+
 const MAX_BYTES = 10 * 1024 * 1024;
 
 @Injectable()
@@ -24,7 +40,7 @@ export class MediaService {
     if (!file) {
       throw new BadRequestException('No file provided');
     }
-    if (!ALLOWED_MIME.has(file.mimetype)) {
+    if (!ALLOWED_IMAGE_MIME.has(file.mimetype)) {
       throw new BadRequestException('Only JPEG, PNG, WebP, and GIF images are allowed');
     }
     if (file.size > MAX_BYTES) {
@@ -34,5 +50,43 @@ export class MediaService {
     const ext = extname(file.originalname).toLowerCase() || `.${file.mimetype.split('/')[1]}`;
     const key = `messages/${userId}/${randomUUID()}${ext}`;
     return this.storage.upload(key, file.buffer, file.mimetype, this.config.minioMediaBucket);
+  }
+
+  async uploadVoice(userId: string, file: Express.Multer.File): Promise<string> {
+    if (!file) {
+      throw new BadRequestException('No file provided');
+    }
+    if (!ALLOWED_AUDIO_MIME.has(file.mimetype)) {
+      throw new BadRequestException('Unsupported audio format');
+    }
+    if (file.size > MAX_BYTES) {
+      throw new BadRequestException('Voice message exceeds 10 MB limit');
+    }
+
+    const ext = pickAudioExt(file);
+    const key = `voice/${userId}/${randomUUID()}${ext}`;
+    return this.storage.upload(key, file.buffer, file.mimetype, this.config.minioMediaBucket);
+  }
+}
+
+function pickAudioExt(file: Express.Multer.File): string {
+  const fromName = extname(file.originalname).toLowerCase();
+  if (fromName) return fromName;
+  switch (file.mimetype) {
+    case 'audio/webm':
+      return '.webm';
+    case 'audio/ogg':
+      return '.ogg';
+    case 'audio/mp4':
+    case 'audio/aac':
+    case 'audio/x-m4a':
+      return '.m4a';
+    case 'audio/mpeg':
+      return '.mp3';
+    case 'audio/wav':
+    case 'audio/x-wav':
+      return '.wav';
+    default:
+      return '.bin';
   }
 }

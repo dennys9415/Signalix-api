@@ -1,8 +1,8 @@
 # Signalix API
 
-**Version: v0.5.0**
+**Version: v0.6.1**
 
-NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, and transactional email.
+NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, and Web Push delivery.
 
 ## Stack
 
@@ -78,6 +78,9 @@ Edit `.env`:
 | `MINIO_BUCKET_AVATARS` | no | Default `signalix-avatars` |
 | `MINIO_BUCKET_MEDIA` | no | Default `signalix-media` (image messages) |
 | `MINIO_BUCKET_FILES` | no | Default `signalix-files` (file attachments) |
+| `VAPID_PUBLIC_KEY` | Push | Generated via `npx web-push generate-vapid-keys`. Empty disables push. |
+| `VAPID_PRIVATE_KEY` | Push | Pair to the public key. Treat as a secret. |
+| `VAPID_SUBJECT` | no | `mailto:` or HTTPS URL identifying the app owner. Default `mailto:admin@signalix.local` |
 
 > **Apple callback URL:** Apple does not permit plain HTTP redirect URIs. Use a tunnel (e.g. ngrok) for local development.
 >
@@ -134,6 +137,7 @@ flyway \
 | `V9__message_reply_forward.sql` | `reply_to_message_id` + `is_forwarded` on `messages` |
 | `V10__link_preview.sql` | `link_preview` JSONB column on `messages` |
 | `V11__read_state.sql` | `chat_read_state` — persistent unread counters per chat per user |
+| `V12__push_subscriptions.sql` | `push_subscriptions` — one row per (user, browser endpoint) for Web Push |
 
 Never edit a deployed migration file — always add a new one.
 
@@ -206,6 +210,17 @@ All routes are prefixed `/api/v1`.
 | POST | `/files/upload` | `multipart/form-data` — uploads a file attachment; returns metadata used in `ciphertext` for `MessageType.FILE` |
 | GET | `/files/:messageId/download` | Streams the attachment back; authorization checked against chat participants |
 | POST | `/media/upload` | `multipart/form-data` — uploads an image; returns URL used in `ciphertext` for `MessageType.IMAGE` |
+| POST | `/media/voice` | `multipart/form-data` (field `audio`) — uploads a voice note (audio/webm, /ogg, /mp4, /aac, /x-m4a, /mpeg, /wav); returns `{ voiceUrl }` baked into `ciphertext` for `MessageType.AUDIO`. Max 10 MB. |
+
+### Web Push (v0.6.0)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/push/public-key` | public | Returns `{ publicKey }` — the VAPID public key (empty string if push is disabled server-side) |
+| POST | `/push/subscribe` | JWT | `{ endpoint, keys: { p256dh, auth } }` — upserts the device subscription for the caller |
+| DELETE | `/push/unsubscribe` | JWT | `{ endpoint }` — removes the subscription for the caller |
+
+Dispatch: when `MessagesService.sendMessage()` finishes its transaction, it fire-and-forgets a push to every other participant whose `presence.status` is not `online` (or who has no `presence` row). Subscriptions returning **404** or **410** from the push service are pruned automatically by `PushService`.
 
 ### Presence (JWT required)
 
@@ -264,6 +279,9 @@ src/
   presence/
     presence.controller.ts     # Lookup, status update
     presence.service.ts
+  push/
+    push.controller.ts         # GET /push/public-key, POST /push/subscribe, DELETE /push/unsubscribe
+    push.service.ts            # web-push dispatch + stale-subscription cleanup
 migrations/
   V1__init.sql
   V2__auth.sql
@@ -276,6 +294,7 @@ migrations/
   V9__message_reply_forward.sql
   V10__link_preview.sql
   V11__read_state.sql
+  V12__push_subscriptions.sql
 ```
 
 ## Docker
@@ -288,6 +307,27 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 ```
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
+
+## v0.6.1 changelog
+
+### Added
+- **Voice messages** — `POST /api/v1/media/voice`. Accepts `audio/webm`, `audio/ogg`, `audio/mp4`, `audio/aac`, `audio/x-m4a`, `audio/mpeg`, `audio/wav`, `audio/x-wav`. Max 10 MB. Object key `voice/{userId}/{uuid}.{ext}` in the `signalix-media` bucket (no new bucket). Returns `{ voiceUrl }` which the frontend wraps into `ciphertext = JSON.stringify({ url, duration, size })` and sends as `MessageType.AUDIO`.
+- **Push preview for AUDIO** — `previewForPush()` returns `🎙️ Voice message` for `MessageType.AUDIO`, so offline-recipient pushes show a sensible body.
+
+### Fixed
+- **`SendMessageDto` accepts AUDIO** — `@IsIn(...)` previously only allowed TEXT, IMAGE, FILE. AUDIO messages from the frontend were rejected with 400 by `class-validator` even though MinIO already had the upload. Widened to include `MessageType.AUDIO`; TS type bound to the new `SendableMessageType` alias from contracts. This is the breaker that made v0.6.1's voice send round-trip work end-to-end.
+
+### Not changed
+- DB schema — `V3__chat.sql`'s `CHECK (message_type IN ('text', 'image', 'video', 'audio', 'file'))` already permitted 'audio'.
+
+## v0.6.0 changelog
+
+### Added
+- **Web Push** — `PushModule` (controller + service + DTOs). New table `push_subscriptions` (V12). Endpoints: `GET /push/public-key`, `POST /push/subscribe`, `DELETE /push/unsubscribe`. `web-push` dependency. VAPID env vars (`VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`). `PushService.sendToUser()` prunes stale subscriptions on 404/410.
+- **Offline-recipient push trigger** — `MessagesService.sendMessage()` queries `presence` for non-sender participants and dispatches a push to anyone not currently `online`. Fire-and-forget; failure never blocks the response.
+
+### Not changed
+- Realtime (`Signalix-realtime`) untouched — the offline check uses the `presence` table only.
 
 ## v0.5.0 changelog
 

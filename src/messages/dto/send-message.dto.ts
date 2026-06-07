@@ -6,7 +6,7 @@ import {
   IsString,
   IsUUID,
 } from 'class-validator';
-import { MessageType, type SendMessageRequest } from '@signalix/contracts';
+import { MessageType, type SendMessageRequest, type SendableMessageType } from '@signalix/contracts';
 
 export class SendMessageDto implements SendMessageRequest {
   @IsOptional()
@@ -21,8 +21,8 @@ export class SendMessageDto implements SendMessageRequest {
   @IsNotEmpty()
   ciphertext!: string;
 
-  @IsIn([MessageType.TEXT, MessageType.IMAGE, MessageType.FILE])
-  messageType!: MessageType.TEXT | MessageType.IMAGE | MessageType.FILE;
+  @IsIn([MessageType.TEXT, MessageType.IMAGE, MessageType.FILE, MessageType.AUDIO])
+  messageType!: SendableMessageType;
 
   @IsOptional()
   @IsString()

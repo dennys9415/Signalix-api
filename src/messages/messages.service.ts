@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
@@ -22,6 +23,7 @@ import {
 } from '@signalix/contracts';
 import { DbService } from '../db/db.service';
 import { LinkPreviewService } from '../link-preview/link-preview.service';
+import { PushService } from '../push/push.service';
 import type { SendMessageDto } from './dto/send-message.dto';
 
 interface MessageStatusRow {
@@ -33,9 +35,12 @@ interface MessageStatusRow {
 
 @Injectable()
 export class MessagesService {
+  private readonly logger = new Logger(MessagesService.name);
+
   constructor(
     private readonly db: DbService,
     private readonly linkPreview: LinkPreviewService,
+    private readonly push: PushService,
   ) {}
 
   async sendMessage(
@@ -170,6 +175,12 @@ export class MessagesService {
       };
     });
 
+    // Fire-and-forget push notifications to offline participants.
+    // Never block or throw — push is best-effort.
+    void this.dispatchPushNotifications(senderId, result.message).catch((err) => {
+      this.logger.warn(`Push dispatch failed: ${(err as Error).message}`);
+    });
+
     // Generate link preview after transaction — failure must never block the send
     if (result.message.messageType === MessageType.TEXT) {
       const url = this.linkPreview.extractFirstUrl(result.message.ciphertext);
@@ -188,6 +199,57 @@ export class MessagesService {
     }
 
     return result;
+  }
+
+  /**
+   * Push to offline participants of `chatId`, excluding the sender.
+   * A participant is "offline" if their presence row says so, or if they
+   * have no presence row at all (never connected this session).
+   */
+  private async dispatchPushNotifications(
+    senderId: string,
+    message: MessageDTO,
+  ): Promise<void> {
+    // Resolve sender display info for the notification title + icon.
+    const senderRow = await this.db.query<{
+      display_name: string | null;
+      username: string;
+      avatar_url: string | null;
+    }>(
+      'SELECT display_name, username, avatar_url FROM users WHERE id = $1',
+      [senderId],
+    );
+    const sender = senderRow.rows[0];
+    if (!sender) return;
+    const senderName = sender.display_name ?? sender.username;
+
+    // Offline = no presence row OR status != 'online'. LEFT JOIN handles the
+    // "never connected" case for newly-created accounts.
+    const recipientsRow = await this.db.query<{ user_id: string }>(
+      `
+      SELECT cp.user_id
+      FROM chat_participants cp
+      LEFT JOIN presence p ON p.user_id = cp.user_id
+      WHERE cp.chat_id = $1
+        AND cp.user_id <> $2
+        AND (p.status IS NULL OR p.status <> 'online')
+      `,
+      [message.chatId, senderId],
+    );
+
+    if (recipientsRow.rows.length === 0) return;
+
+    const body = previewForPush(message.ciphertext, message.messageType);
+    const payload = {
+      title: senderName,
+      body,
+      chatId: message.chatId,
+      avatarUrl: sender.avatar_url,
+    };
+
+    await Promise.all(
+      recipientsRow.rows.map((r) => this.push.sendToUser(r.user_id, payload)),
+    );
   }
 
   async updateStatus(
@@ -519,6 +581,21 @@ export class MessagesService {
 
 function buildDirectPairKey(a: string, b: string): string {
   return [a, b].sort().join(':');
+}
+
+function previewForPush(ciphertext: string, type: MessageType): string {
+  if (type === MessageType.IMAGE) return '📷 Photo';
+  if (type === MessageType.AUDIO) return '🎙️ Voice message';
+  if (type === MessageType.FILE) {
+    try {
+      const parsed = JSON.parse(ciphertext) as { name?: unknown };
+      return typeof parsed.name === 'string' ? `📎 ${parsed.name}` : '📎 File';
+    } catch {
+      return '📎 File';
+    }
+  }
+  const trimmed = ciphertext.trim();
+  return trimmed.length > 140 ? `${trimmed.slice(0, 140)}…` : trimmed;
 }
 
 function toStatusDTO(row: MessageStatusRow): MessageStatusDTO {
