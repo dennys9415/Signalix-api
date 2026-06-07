@@ -1,4 +1,5 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { webcrypto } from 'node:crypto';
 import {
   DeviceKeyBundleDTO,
   ErrorCode,
@@ -19,6 +20,13 @@ import {
   UploadPreKeysDto,
 } from './dto/key-material.dto';
 
+// Wire-format byte sizes. We enforce these to keep callers honest and to
+// turn a malformed publish into a 400 rather than a corrupt row that
+// other devices will reject later in a less observable way.
+const X25519_RAW_BYTES = 32;
+const ED25519_RAW_BYTES = 32;
+const ED25519_SIG_BYTES = 64;
+
 /**
  * Storage layer for the v0.8.0 encryption foundation. Owns the lifecycle
  * of identity keys, signed pre-keys, and one-time pre-keys, plus the
@@ -32,6 +40,8 @@ import {
  */
 @Injectable()
 export class CryptoService {
+  private readonly logger = new Logger(CryptoService.name);
+
   constructor(private readonly db: DbService) {}
 
   async registerDeviceKeys(
@@ -41,6 +51,16 @@ export class CryptoService {
     const algorithm: KeyAlgorithm = (dto.algorithm ?? 'x25519') as KeyAlgorithm;
     const identityBuf = decodeKey(dto.identityKey, 'identityKey');
     const signingBuf = decodeKey(dto.signingKey, 'signingKey');
+
+    assertSize(identityBuf, X25519_RAW_BYTES, 'identityKey');
+    assertSize(signingBuf, ED25519_RAW_BYTES, 'signingKey');
+
+    // Server-side signature verification was a v0.9.0 TODO. v0.9.1 lands
+    // it: reject malformed bundles before they pollute the device key tables.
+    await assertSignedPreKeySignature(dto.signedPreKey, dto.signingKey, this.logger);
+    for (const pk of dto.preKeys) {
+      assertSize(decodeKey(pk.publicKey, 'preKey.publicKey'), X25519_RAW_BYTES, 'preKey.publicKey');
+    }
 
     return this.db.transaction(async (client) => {
       // Identity is an upsert — re-registering a device replaces its
@@ -106,6 +126,22 @@ export class CryptoService {
     const signature = decodeKey(spk.signature, 'signedPreKey.signature');
     const algorithm: KeyAlgorithm = (spk.algorithm ?? 'x25519') as KeyAlgorithm;
 
+    // Look up the signing key the device registered originally; the new
+    // signed pre-key signature must verify against it. Without this the
+    // server would happily accept rotated SPKs from a hijacked client.
+    const signingRow = await this.db.query<{ signing_key: Buffer }>(
+      'SELECT signing_key FROM device_identity_keys WHERE device_id = $1',
+      [deviceId],
+    );
+    if (signingRow.rows.length === 0) {
+      throw new BadRequestException({
+        code: ErrorCode.VALIDATION_ERROR,
+        message: 'Device has no registered identity keys; cannot rotate signed pre-key.',
+      });
+    }
+    const signingKeyB64 = signingRow.rows[0].signing_key.toString('base64url');
+    await assertSignedPreKeySignature(spk, signingKeyB64, this.logger);
+
     return this.db.transaction(async (client) => {
       // Mark any *unrotated* prior signed pre-keys as rotated. We keep
       // the rows around for late handshakes that still reference them.
@@ -139,6 +175,9 @@ export class CryptoService {
     dto: UploadPreKeysDto,
   ): Promise<UploadPreKeysResponse> {
     const algorithm: KeyAlgorithm = (dto.algorithm ?? 'x25519') as KeyAlgorithm;
+    for (const pk of dto.preKeys) {
+      assertSize(decodeKey(pk.publicKey, 'preKey.publicKey'), X25519_RAW_BYTES, 'preKey.publicKey');
+    }
     for (const pk of dto.preKeys) {
       await this.db.query(
         `
@@ -276,6 +315,65 @@ function decodeKey(base64url: string, field: string): Buffer {
 
 function encodeKey(buf: Buffer): string {
   return buf.toString('base64url');
+}
+
+function assertSize(buf: Buffer, expected: number, field: string): void {
+  if (buf.length !== expected) {
+    throw new BadRequestException({
+      code: ErrorCode.VALIDATION_ERROR,
+      message: `Invalid byte length for ${field}: expected ${expected}, got ${buf.length}.`,
+    });
+  }
+}
+
+/**
+ * Verify the Ed25519 signature on a signed pre-key against the device's
+ * registered signing key. Throws BadRequestException on any failure so
+ * the controller turns it into a 400 VALIDATION_ERROR. In development
+ * we log the failure reason; in production we keep the response generic
+ * so the wire shape doesn't leak which step rejected.
+ */
+async function assertSignedPreKeySignature(
+  spk: SignedPreKeyMaterialDto,
+  signingKeyB64: string,
+  logger: Logger,
+): Promise<void> {
+  const publicKey = decodeKey(spk.publicKey, 'signedPreKey.publicKey');
+  const signature = decodeKey(spk.signature, 'signedPreKey.signature');
+  const signingKey = decodeKey(signingKeyB64, 'signingKey');
+
+  assertSize(publicKey, X25519_RAW_BYTES, 'signedPreKey.publicKey');
+  assertSize(signature, ED25519_SIG_BYTES, 'signedPreKey.signature');
+  assertSize(signingKey, ED25519_RAW_BYTES, 'signingKey');
+
+  let ok = false;
+  try {
+    const key = await webcrypto.subtle.importKey(
+      'raw',
+      signingKey,
+      { name: 'Ed25519' },
+      false,
+      ['verify'],
+    );
+    ok = await webcrypto.subtle.verify('Ed25519', key, signature, publicKey);
+  } catch (err) {
+    if (process.env.NODE_ENV !== 'production') {
+      logger.debug(`Ed25519 verify threw: ${(err as Error).message}`);
+    }
+    throw new BadRequestException({
+      code: ErrorCode.VALIDATION_ERROR,
+      message: 'Signed pre-key signature could not be verified.',
+    });
+  }
+  if (!ok) {
+    if (process.env.NODE_ENV !== 'production') {
+      logger.debug(`Ed25519 signature mismatch for SPK keyId=${spk.keyId}`);
+    }
+    throw new BadRequestException({
+      code: ErrorCode.VALIDATION_ERROR,
+      message: 'Signed pre-key signature did not verify against the device signing key.',
+    });
+  }
 }
 
 // Re-export key DTO shapes so other API services can import them centrally.

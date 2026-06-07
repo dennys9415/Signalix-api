@@ -1,10 +1,10 @@
 # Signalix API
 
-**Version: v0.9.0**
+**Version: v0.9.1**
 
-NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, the v0.8.0 crypto foundation, and (v0.9.0) **real beta E2EE for direct text messages** — `messages.ciphertext` for those rows now carries an opaque ECDH+AES-GCM envelope written by v0.9.0 clients.
+NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, the v0.8.0 crypto foundation, and (v0.9.0+) **real beta E2EE for direct text messages** — `messages.ciphertext` for those rows carries an opaque ECDH+AES-GCM envelope written by v0.9.0+ clients. **v0.9.1 hardens publish-time validation**: every signed pre-key's Ed25519 signature is verified against the device's `signingKey` *before* the row is written, and every key-material field is byte-length-checked.
 
-> ⚠️ **Beta E2EE — not production-grade.** v0.9.0 turns on direct-text E2EE between v0.9.0+ clients. The API stores opaque ciphertext for those rows; everything else (groups, images, files, voice notes) still flows as plaintext. No signature verification on signed pre-keys yet, no Double Ratchet, single-device assumption. **v0.10.0** hardens this; v0.11.0+ extends to groups + media.
+> ⚠️ **Beta E2EE — not production-grade.** v0.9.0 enables direct-text E2EE between v0.9.0+ clients; v0.9.1 adds server-side signature verification and stricter input validation so a malformed bundle can no longer pollute the device key tables. Groups, images, files, voice notes still flow as plaintext. No Double Ratchet, single-device assumption. **v0.10.0** lands multi-device fan-out, Double Ratchet, encrypted push previews, automatic signed-pre-key rotation; v0.11.0+ extends to groups + media.
 
 ## Stack
 
@@ -335,9 +335,26 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
 
+## v0.9.1 changelog — E2EE hardening
+
+### Added
+- **Ed25519 signature verification on signed pre-keys (`crypto.service.ts`).** Both `registerDeviceKeys` and `rotateSignedPreKey` now call `assertSignedPreKeySignature(...)` before writing the row. It uses Node 20+ `webcrypto.subtle.verify('Ed25519', …)` to confirm that the supplied `signedPreKey.signature` is a valid Ed25519 signature over `signedPreKey.publicKey` produced by the device's `signingKey`. Failure → 400 `VALIDATION_ERROR` with a generic public message; the dev log records the rejected `keyId` for diagnosis.
+- **Wire-format byte-length checks** for every key material field — 32 bytes for `identityKey`, `signingKey`, `signedPreKey.publicKey`, every `preKey.publicKey`; 64 bytes for `signedPreKey.signature`. Anything else is rejected up front rather than persisted as a corrupt row that downstream peers will fail to decrypt against.
+- **Rotate flow looks up the device's existing `signingKey`** from `device_identity_keys` so a rotated SPK is always verified against the originally-registered signing key. If no identity row exists yet, rotation 400s with a clear message.
+
+### Not changed
+- REST routes, DTOs, response shapes — identical to v0.9.0.
+- Database schema (`V14__crypto_foundation.sql`) — no migration in v0.9.1.
+- All other endpoints (auth, chats, messages, search, push, presence) — untouched.
+
+### Operational notes
+- After deploy, the first time existing clients call `POST /crypto/devices/keys` or `PATCH …/signed-pre-key` their bundle will be re-validated. Any pre-existing client that was publishing malformed material starts getting 400s — this is the intended behavior and the trigger to debug that client.
+- Watch the `CryptoService` Logger for verification failures the first day or two; the dev-only log line records the rejected `keyId`.
+- **Server-side state was already correct in v0.9.0** for one-time pre-key consumption (`pre_keys.consumed_at` is set inside `getKeyBundle` via `UPDATE … RETURNING …`). v0.9.1's pre-key consumption change is purely client-side: the local IDB now mirrors that state for accurate top-up math.
+
 ## v0.9.0 changelog — Signal Protocol Beta backend bits
 
-> ⚠️ **Beta E2EE.** v0.9.0 turns on real end-to-end encryption for direct text messages between v0.9.0 clients. The API stores opaque ciphertext for these rows; everything else (groups, images, files, voice notes) still flows as plaintext. **No signature verification yet** on signed pre-keys — that's v0.10.0.
+> ⚠️ **Beta E2EE.** v0.9.0 turns on real end-to-end encryption for direct text messages between v0.9.0 clients. The API stores opaque ciphertext for these rows; everything else (groups, images, files, voice notes) still flows as plaintext. **Signed-pre-key signature verification lands in v0.9.1** (this file).
 
 ### Not changed
 - All v0.8.0 crypto endpoints (`POST /crypto/devices/keys`, `PATCH …/signed-pre-key`, `POST …/pre-keys`, `GET /crypto/users/:userId/key-bundle`) are unchanged. The v0.9.0 frontend simply starts calling them at login.
