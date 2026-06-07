@@ -1,10 +1,13 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { randomUUID } from 'crypto';
+import { extname } from 'path';
 import {
   ChatDTO,
   ChatParticipantDTO,
   ChatType,
   DeleteChatForMeResponse,
   ErrorCode,
+  GroupAvatarUploadResponse,
   GroupMemberUpdateResponse,
   LinkPreviewDTO,
   MarkChatReadResponse,
@@ -15,14 +18,22 @@ import {
   ParticipantRole,
   RemoveGroupMemberResponse,
   ReplyPreviewDTO,
+  TransferGroupOwnershipResponse,
+  UpdateGroupChatRequest,
   UpdateGroupChatResponse,
 } from '@signalix/contracts';
 import { DbService } from '../db/db.service';
+import { StorageService } from '../storage/storage.service';
+
+const ALLOWED_AVATAR_MIME = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
+const MAX_AVATAR_BYTES = 5 * 1024 * 1024;
 
 interface ChatRow {
   chat_id: string;
   chat_type: string;
   chat_title: string | null;
+  chat_avatar_url: string | null;
+  chat_description: string | null;
   created_by: string;
   chat_created_at: Date;
   participant_user_id: string;
@@ -56,18 +67,23 @@ interface MessageRow {
 
 @Injectable()
 export class ChatsService {
-  constructor(private readonly db: DbService) {}
+  constructor(
+    private readonly db: DbService,
+    private readonly storage: StorageService,
+  ) {}
 
   async getUserChats(userId: string): Promise<ChatDTO[]> {
     const result = await this.db.query<ChatRow>(`
       SELECT
-        c.id         AS chat_id,
-        c.type       AS chat_type,
-        c.title      AS chat_title,
+        c.id          AS chat_id,
+        c.type        AS chat_type,
+        c.title       AS chat_title,
+        c.avatar_url  AS chat_avatar_url,
+        c.description AS chat_description,
         c.created_by,
-        c.created_at AS chat_created_at,
-        cp.user_id   AS participant_user_id,
-        cp.role      AS participant_role,
+        c.created_at  AS chat_created_at,
+        cp.user_id    AS participant_user_id,
+        cp.role       AS participant_role,
         cp.joined_at,
         u.username,
         u.display_name,
@@ -99,6 +115,8 @@ export class ChatsService {
           id: row.chat_id,
           type: row.chat_type as ChatType,
           ...(row.chat_title !== null && { title: row.chat_title }),
+          ...(row.chat_avatar_url !== null && { avatarUrl: row.chat_avatar_url }),
+          ...(row.chat_description !== null && { description: row.chat_description }),
           createdBy: row.created_by,
           createdAt: row.chat_created_at.toISOString(),
           participants: [],
@@ -520,8 +538,191 @@ export class ChatsService {
   async updateGroupChat(
     chatId: string,
     userId: string,
-    title: string,
+    dto: UpdateGroupChatRequest,
   ): Promise<UpdateGroupChatResponse> {
+    await this.assertManager(chatId, userId, 'edit the group');
+
+    if (dto.title === undefined && dto.description === undefined) {
+      throw new BadRequestException({
+        code: ErrorCode.VALIDATION_ERROR,
+        message: 'At least one of title or description must be provided.',
+      });
+    }
+
+    // Build the UPDATE dynamically so we only touch the fields that were
+    // explicitly sent. `null` on description clears the column.
+    const sets: string[] = ['updated_at = NOW()'];
+    const params: unknown[] = [];
+    let idx = 1;
+    let trimmedTitle: string | undefined;
+    let normalizedDescription: string | null | undefined;
+
+    if (dto.title !== undefined) {
+      trimmedTitle = dto.title.trim();
+      sets.push(`title = $${idx}`);
+      params.push(trimmedTitle);
+      idx += 1;
+    }
+    if (dto.description !== undefined) {
+      // Empty string is treated as clearing the description.
+      const trimmed = dto.description === null ? null : dto.description.trim();
+      normalizedDescription = trimmed === '' ? null : trimmed;
+      sets.push(`description = $${idx}`);
+      params.push(normalizedDescription);
+      idx += 1;
+    }
+
+    params.push(chatId);
+    await this.db.query(
+      `UPDATE chats SET ${sets.join(', ')} WHERE id = $${idx}`,
+      params,
+    );
+
+    return {
+      chatId,
+      ...(trimmedTitle !== undefined && { title: trimmedTitle }),
+      ...(normalizedDescription !== undefined && { description: normalizedDescription }),
+    };
+  }
+
+  async uploadGroupAvatar(
+    chatId: string,
+    userId: string,
+    file: Express.Multer.File,
+  ): Promise<GroupAvatarUploadResponse> {
+    if (!file) {
+      throw new BadRequestException('No file provided');
+    }
+    if (!ALLOWED_AVATAR_MIME.has(file.mimetype)) {
+      throw new BadRequestException('Only JPEG, PNG, and WebP files are allowed');
+    }
+    if (file.size > MAX_AVATAR_BYTES) {
+      throw new BadRequestException('File exceeds 5 MB limit');
+    }
+
+    await this.assertManager(chatId, userId, 'change the group avatar');
+
+    // Snapshot the prior avatar URL so we can prune the old object after the
+    // new one is committed to the DB. Failure to prune is logged but never
+    // propagated — the upload still succeeded.
+    const old = await this.db.query<{ avatar_url: string | null }>(
+      'SELECT avatar_url FROM chats WHERE id = $1',
+      [chatId],
+    );
+
+    const ext = extname(file.originalname).toLowerCase() || `.${file.mimetype.split('/')[1]}`;
+    const key = `chats/${chatId}/${randomUUID()}${ext}`;
+    const url = await this.storage.upload(key, file.buffer, file.mimetype);
+
+    await this.db.query(
+      'UPDATE chats SET avatar_url = $1, updated_at = NOW() WHERE id = $2',
+      [url, chatId],
+    );
+
+    const oldUrl = old.rows[0]?.avatar_url;
+    if (oldUrl) {
+      const oldKey = this.keyFromUrl(oldUrl);
+      if (oldKey) await this.storage.delete(oldKey).catch(() => {});
+    }
+
+    return { chatId, avatarUrl: url };
+  }
+
+  async removeGroupAvatar(chatId: string, userId: string): Promise<void> {
+    await this.assertManager(chatId, userId, 'remove the group avatar');
+
+    const res = await this.db.query<{ avatar_url: string | null }>(
+      'SELECT avatar_url FROM chats WHERE id = $1',
+      [chatId],
+    );
+    const url = res.rows[0]?.avatar_url;
+    await this.db.query(
+      'UPDATE chats SET avatar_url = NULL, updated_at = NOW() WHERE id = $1',
+      [chatId],
+    );
+    if (url) {
+      const key = this.keyFromUrl(url);
+      if (key) await this.storage.delete(key).catch(() => {});
+    }
+  }
+
+  async transferOwnership(
+    chatId: string,
+    currentOwnerId: string,
+    newOwnerId: string,
+  ): Promise<TransferGroupOwnershipResponse> {
+    if (currentOwnerId === newOwnerId) {
+      throw new BadRequestException({
+        code: ErrorCode.VALIDATION_ERROR,
+        message: 'You already own this group.',
+      });
+    }
+
+    return this.db.transaction(async (client) => {
+      const chatRow = await client.query<{ type: string }>(
+        'SELECT type FROM chats WHERE id = $1',
+        [chatId],
+      );
+      if (chatRow.rows.length === 0) {
+        throw new NotFoundException({ code: ErrorCode.CHAT_NOT_FOUND, message: 'Chat not found.' });
+      }
+      if (chatRow.rows[0].type !== 'group') {
+        throw new BadRequestException({ code: ErrorCode.VALIDATION_ERROR, message: 'Not a group chat.' });
+      }
+
+      const requesterRow = await client.query<{ role: string }>(
+        'SELECT role FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+        [chatId, currentOwnerId],
+      );
+      if (requesterRow.rows.length === 0 || requesterRow.rows[0].role !== ParticipantRole.OWNER) {
+        throw new ForbiddenException({
+          code: ErrorCode.FORBIDDEN,
+          message: 'Only the current owner can transfer ownership.',
+        });
+      }
+
+      const targetRow = await client.query<{ role: string }>(
+        'SELECT role FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+        [chatId, newOwnerId],
+      );
+      if (targetRow.rows.length === 0) {
+        throw new BadRequestException({
+          code: ErrorCode.VALIDATION_ERROR,
+          message: 'New owner must already be a member of the group.',
+        });
+      }
+
+      // Atomic role swap: previous owner → admin, new member → owner.
+      // The chat_participants PK is (chat_id, user_id) so we update by both keys.
+      await client.query(
+        `UPDATE chat_participants SET role = 'admin' WHERE chat_id = $1 AND user_id = $2`,
+        [chatId, currentOwnerId],
+      );
+      await client.query(
+        `UPDATE chat_participants SET role = 'owner' WHERE chat_id = $1 AND user_id = $2`,
+        [chatId, newOwnerId],
+      );
+      await client.query(
+        `UPDATE chats SET updated_at = NOW() WHERE id = $1`,
+        [chatId],
+      );
+
+      const participants = await this.fetchParticipants(client, chatId);
+      return {
+        chatId,
+        ownerId: newOwnerId,
+        previousOwnerId: currentOwnerId,
+        participants,
+      };
+    });
+  }
+
+  /**
+   * Verifies the caller is currently OWNER or ADMIN of the group chat.
+   * Centralises the role check used by update/avatar/etc. so error messages
+   * stay consistent and we avoid drift between endpoints.
+   */
+  private async assertManager(chatId: string, userId: string, action: string): Promise<void> {
     const row = await this.db.query<{ role: string; chat_type: string }>(
       `SELECT cp.role, c.type AS chat_type
        FROM chat_participants cp
@@ -538,16 +739,54 @@ export class ChatsService {
     }
     const role = row.rows[0].role;
     if (role !== ParticipantRole.OWNER && role !== ParticipantRole.ADMIN) {
-      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'Only the owner or admin can rename the group.' });
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: `Only the owner or admin can ${action}.`,
+      });
     }
+  }
 
-    const trimmed = title.trim();
-    await this.db.query(
-      'UPDATE chats SET title = $1, updated_at = NOW() WHERE id = $2',
-      [trimmed, chatId],
+  /**
+   * Re-fetches the full participant list for `chatId` using the supplied
+   * pg client (lets us share the connection with an enclosing transaction).
+   */
+  private async fetchParticipants(
+    client: import('pg').PoolClient,
+    chatId: string,
+  ): Promise<ChatParticipantDTO[]> {
+    const result = await client.query<{
+      user_id: string; role: string; joined_at: Date;
+      username: string; display_name: string; avatar_url: string | null;
+    }>(
+      `SELECT cp.user_id, cp.role, cp.joined_at, u.username, u.display_name, u.avatar_url
+       FROM chat_participants cp
+       JOIN users u ON u.id = cp.user_id
+       WHERE cp.chat_id = $1`,
+      [chatId],
     );
+    return result.rows.map((r) => ({
+      chatId,
+      userId: r.user_id,
+      role: r.role as ParticipantRole,
+      joinedAt: r.joined_at.toISOString(),
+      user: {
+        id: r.user_id,
+        username: r.username,
+        displayName: r.display_name,
+        ...(r.avatar_url !== null && { avatarUrl: r.avatar_url }),
+      },
+    }));
+  }
 
-    return { chatId, title: trimmed };
+  private keyFromUrl(url: string): string | null {
+    try {
+      const u = new URL(url);
+      // Storage URLs look like `{publicUrl}/{bucket}/{key}`.
+      const parts = u.pathname.slice(1).split('/');
+      return parts.slice(1).join('/') || null;
+    } catch {
+      return null;
+    }
   }
 
   async deleteChatForMe(chatId: string, userId: string): Promise<DeleteChatForMeResponse> {

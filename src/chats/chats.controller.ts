@@ -1,13 +1,31 @@
-import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Patch,
+  Post,
+  Query,
+  UploadedFile,
+  UseGuards,
+  UseInterceptors,
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { memoryStorage } from 'multer';
 import type {
   ApiResponse,
   ChatDTO,
   CreateGroupChatResponse,
   DeleteChatForMeResponse,
   GetMessagesResponse,
+  GroupAvatarUploadResponse,
   GroupMemberUpdateResponse,
   MarkChatReadResponse,
   RemoveGroupMemberResponse,
+  TransferGroupOwnershipResponse,
   UpdateGroupChatResponse,
 } from '@signalix/contracts';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
@@ -18,6 +36,7 @@ import { GetMessagesDto } from './dto/get-messages.dto';
 import { CreateGroupChatDto } from './dto/create-group-chat.dto';
 import { AddGroupMembersDto } from './dto/add-group-members.dto';
 import { UpdateGroupChatDto } from './dto/update-group-chat.dto';
+import { TransferOwnershipDto } from './dto/transfer-ownership.dto';
 import { ChatsService } from './chats.service';
 
 @Controller('chats')
@@ -114,7 +133,40 @@ export class ChatsController {
     @Body() dto: UpdateGroupChatDto,
     @CurrentUser() user: JwtPayload,
   ): Promise<ApiResponse<UpdateGroupChatResponse>> {
-    const result = await this.chatsService.updateGroupChat(chatId, user.sub, dto.title);
+    const result = await this.chatsService.updateGroupChat(chatId, user.sub, dto);
+    return ok(result);
+  }
+
+  @Post(':chatId/avatar')
+  @HttpCode(HttpStatus.OK)
+  @UseInterceptors(FileInterceptor('avatar', { storage: memoryStorage() }))
+  async uploadGroupAvatar(
+    @Param('chatId') chatId: string,
+    @CurrentUser() user: JwtPayload,
+    @UploadedFile() file: Express.Multer.File,
+  ): Promise<ApiResponse<GroupAvatarUploadResponse>> {
+    const result = await this.chatsService.uploadGroupAvatar(chatId, user.sub, file);
+    return ok(result);
+  }
+
+  @Delete(':chatId/avatar')
+  @HttpCode(HttpStatus.OK)
+  async removeGroupAvatar(
+    @Param('chatId') chatId: string,
+    @CurrentUser() user: JwtPayload,
+  ): Promise<ApiResponse<{ chatId: string }>> {
+    await this.chatsService.removeGroupAvatar(chatId, user.sub);
+    return ok({ chatId });
+  }
+
+  @Post(':chatId/transfer-ownership')
+  @HttpCode(HttpStatus.OK)
+  async transferOwnership(
+    @Param('chatId') chatId: string,
+    @Body() dto: TransferOwnershipDto,
+    @CurrentUser() user: JwtPayload,
+  ): Promise<ApiResponse<TransferGroupOwnershipResponse>> {
+    const result = await this.chatsService.transferOwnership(chatId, user.sub, dto.newOwnerId);
     return ok(result);
   }
 }

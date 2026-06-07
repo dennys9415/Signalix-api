@@ -1,6 +1,6 @@
 # Signalix API
 
-**Version: v0.6.1**
+**Version: v0.7.0**
 
 NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, and Web Push delivery.
 
@@ -138,6 +138,7 @@ flyway \
 | `V10__link_preview.sql` | `link_preview` JSONB column on `messages` |
 | `V11__read_state.sql` | `chat_read_state` — persistent unread counters per chat per user |
 | `V12__push_subscriptions.sql` | `push_subscriptions` — one row per (user, browser endpoint) for Web Push |
+| `V13__chats_avatar_description.sql` | `chats.avatar_url` + `chats.description` — group avatar URL (MinIO public URL) and editable group description (max 500 chars enforced by API DTO) |
 
 Never edit a deployed migration file — always add a new one.
 
@@ -187,8 +188,11 @@ All routes are prefixed `/api/v1`.
 | POST | `/chats/:chatId/read` | Marks chat as read; clears persistent unread counter |
 | POST | `/chats/:chatId/delete-for-me` | Sets `chat_deletions.deleted_at` cutoff for the caller |
 | POST | `/chats/group` | `{ title, memberIds }` — creates a group chat |
-| PATCH | `/chats/:chatId` | `{ title }` — renames a group chat (owner only) |
-| POST | `/chats/:chatId/members` | `{ userIds }` — adds group members (owner only) |
+| PATCH | `/chats/:chatId` | `{ title?, description? }` — renames a group and/or sets the description (owner or admin). Pass `description: null` to clear. At least one field required. |
+| POST | `/chats/:chatId/avatar` | `multipart/form-data` (field `avatar`) — uploads a group avatar (JPEG / PNG / WebP, max 5 MB). Owner or admin. Returns `{ chatId, avatarUrl }`. Stored under `chats/{chatId}/` in the `signalix-avatars` bucket. |
+| DELETE | `/chats/:chatId/avatar` | Removes the group avatar. Owner or admin. |
+| POST | `/chats/:chatId/transfer-ownership` | `{ newOwnerId }` — atomic role swap: caller (current owner) is demoted to admin, target member becomes owner. Owner only. |
+| POST | `/chats/:chatId/members` | `{ userIds }` — adds group members (owner or admin) |
 | DELETE | `/chats/:chatId/members/:userId` | Removes member or self-leaves the group |
 
 ### Messages (JWT required)
@@ -307,6 +311,21 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 ```
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
+
+## v0.7.0 changelog
+
+### Added
+- **Group avatar** — `POST /chats/:chatId/avatar` (multipart `avatar`, JPEG/PNG/WebP, ≤5 MB) and `DELETE /chats/:chatId/avatar`. Owner/admin only. `ChatsService.uploadGroupAvatar()` reuses `StorageService` against the existing `signalix-avatars` bucket under a `chats/{chatId}/{uuid}.{ext}` key prefix — no new bucket. Stale objects are pruned in-band when replaced. `ChatsModule` now imports `StorageModule`.
+- **Group description** — `chats.description` column (V13). `PATCH /chats/:chatId` accepts `{ title?, description? }`. Description is plain text, max 500 chars, owner/admin editable. `null` clears the field; empty string is normalized to `null`.
+- **Transfer ownership** — `POST /chats/:chatId/transfer-ownership` `{ newOwnerId }`. Owner-only. Runs as a single DB transaction: validates the chat type, checks the requester is the current owner, checks the target is a member, demotes the requester to `admin`, promotes the target to `owner`, bumps `chats.updated_at`, returns the full refreshed participant list.
+- **`ChatDTO.avatarUrl` and `ChatDTO.description`** — surfaced from `getUserChats()` so chat list rendering and message-view headers pick them up without an extra fetch.
+
+### Changed
+- `ChatsService.updateGroupChat` signature changed from `(chatId, userId, title)` to `(chatId, userId, dto)` to accept the new optional title/description shape. PATCH endpoint now rejects bodies with no fields with a 400.
+- `assertManager(chatId, userId, action)` helper centralises the owner-or-admin role check used by update/avatar endpoints — keeps error messages and behaviour consistent across surfaces.
+
+### Not changed
+- Migration is purely additive — no realtime, no contracts breaks, no existing endpoint signatures changed except for the optional widening of PATCH body.
 
 ## v0.6.1 changelog
 
