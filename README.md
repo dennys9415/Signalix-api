@@ -1,6 +1,6 @@
 # Signalix API
 
-**Version: v0.11.0**
+**Version: v0.12.0**
 
 NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, the v0.8.0 crypto foundation, v0.9.x **direct-text E2EE**, and **v0.10.0 group-text E2EE beta** — group text sends now persist one row per (message × recipient × device) in `group_message_recipients` while the `messages` row carries an empty sentinel ciphertext.
 
@@ -334,6 +334,13 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 ```
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
+
+## v0.12.0 changelog — Safety number / device verification UI (api no-op)
+
+### Not changed
+- v0.12.0's verification feature lives entirely in `Signalix-frontend`'s IndexedDB. The API doesn't store or expose verification state in v0.12.0 — that's a deliberate scope limit (no production trust model yet).
+- No new endpoints, no DB migration, no env var changes.
+- Existing `GET /crypto/users/:userId/key-bundle` continues to drive the frontend's live-view refresh; the v0.9.1 Ed25519 signature check still gates which bundles ever reach the UI.
 
 ## v0.11.0 changelog — Media / file / voice E2EE beta
 
