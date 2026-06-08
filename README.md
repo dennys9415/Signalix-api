@@ -1,10 +1,10 @@
 # Signalix API
 
-**Version: v0.9.1**
+**Version: v0.10.1**
 
-NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, the v0.8.0 crypto foundation, and (v0.9.0+) **real beta E2EE for direct text messages** — `messages.ciphertext` for those rows carries an opaque ECDH+AES-GCM envelope written by v0.9.0+ clients. **v0.9.1 hardens publish-time validation**: every signed pre-key's Ed25519 signature is verified against the device's `signingKey` *before* the row is written, and every key-material field is byte-length-checked.
+NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, the v0.8.0 crypto foundation, v0.9.x **direct-text E2EE**, and **v0.10.0 group-text E2EE beta** — group text sends now persist one row per (message × recipient × device) in `group_message_recipients` while the `messages` row carries an empty sentinel ciphertext.
 
-> ⚠️ **Beta E2EE — not production-grade.** v0.9.0 enables direct-text E2EE between v0.9.0+ clients; v0.9.1 adds server-side signature verification and stricter input validation so a malformed bundle can no longer pollute the device key tables. Groups, images, files, voice notes still flow as plaintext. No Double Ratchet, single-device assumption. **v0.10.0** lands multi-device fan-out, Double Ratchet, encrypted push previews, automatic signed-pre-key rotation; v0.11.0+ extends to groups + media.
+> ⚠️ **Beta E2EE — not production-grade.** v0.9.0 enabled direct-text E2EE; v0.9.1 added server-side Ed25519 signature verification + strict size checks; **v0.10.0 extends E2EE to group text via per-recipient fan-out** (one row per recipient device in `group_message_recipients`). Group images / files / voice notes still flow as plaintext. Per-message cost is `O(participants)` — Sender Keys land in v0.11.0 to drop that to `O(1)`. Single-device assumption from v0.9.x carries over.
 
 ## Stack
 
@@ -334,6 +334,50 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 ```
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
+
+## v0.10.1 changelog — Multi-device hygiene + group-create broadcast
+
+### Added
+- **`GET /api/v1/chats/:chatId`** + `ChatsService.getChatById(chatId, userId)` — single-chat lookup returning the full ChatDTO (with participants). Forbidden for non-participants; 404 if not found. Used by the realtime layer to canonicalize `client.chat.created` events before fan-out.
+- **`ChatsController.getMessages` + `ChatsService.getMessages` accept `deviceId`** (from JWT) — the `LEFT JOIN group_message_recipients` now filters `(recipient_user_id = $2, recipient_device_id = $3)` so a multi-device user no longer sees duplicate rows per message in history.
+- **Reset-aware `CryptoService.registerDeviceKeys`.** Detects an identity-key change versus the row already stored and, in the same transaction, `DELETE`s the device's prior `signed_pre_keys` + `pre_keys` before inserting the new material. Without this, the bundle endpoint kept handing out orphan one-time pre-key ids that the recipient's IDB no longer held → `Local one-time pre-key X not found`.
+- **`recipientPayloads` keyed by `recipientDeviceId`** (not userId) in `MessagesService.sendMessage` + `editMessage`. The `chatType !== GROUP` guard was lifted so direct chats with multiple recipient devices can also fan out.
+- **Nest `Logger` lines** on `registerDeviceKeys` (reset flag, spk + prekey ids, unconsumed count), `uploadPreKeys` (added ids + remaining count), `getKeyBundle` (chosen per-device pk + spk).
+
+### Fixed
+- The `recipientPayloads` last-write-wins bug — a multi-device recipient used to get the same envelope on every connection because the map key collided per user.
+- `getMessages` row duplication for multi-device users — fixed by the per-device JOIN filter.
+
+### Not changed
+- All other endpoints, auth, presence, search, push, voice notes, link previews — unchanged.
+- No DB migration; schema is identical to v0.10.0 (V15).
+
+### Operational notes
+- Deploy this BEFORE the frontend so the server-side stale-key wipe is ready when the frontend's forced cleanup hits. Server logs will show a burst of `Identity key changed for device X; wiping stale SPKs + pre-keys server-side.` for the first 24-48h — that's the cleanup converging.
+- The new `GET /chats/:chatId` is additive; existing clients keep working.
+
+## v0.10.0 changelog — Group E2EE beta
+
+### Added
+- **Migration `V15__group_message_recipients.sql`** — new table with PK `(message_id, recipient_user_id, recipient_device_id)`. Columns: `ciphertext`, `encryption_version`, optional `pre_key_id` + `signed_pre_key_id`, `created_at`. `ON DELETE CASCADE` from `messages` and `users`. Index on `(recipient_user_id, message_id)` for the history-fetch JOIN.
+- **`MessagesService.sendMessage` group fan-out.** When `recipients[]` is present + chat is a group + message is TEXT: validates each `recipientUserId` is a participant (and is not the sender) via `assertRecipientsAreParticipants`; writes `messages` row with empty ciphertext + `encryption_version=1`; inserts N rows into `group_message_recipients`; returns `recipientPayloads: Record<UUID, RecipientEnvelopeDTO>` so the realtime layer can fan out per-recipient.
+- **`MessagesService.editMessage` re-fan-out.** DELETE + INSERT the new per-recipient rows in a single transaction. The method now accepts the full `EditMessageDto` (envelope re-routing for direct E2EE edits + `recipients[]` for group encrypted edits). Same `recipientPayloads` map in the response.
+- **`ChatsService.getMessages` per-recipient JOIN.** `LEFT JOIN group_message_recipients gmr ON gmr.message_id = m.id AND gmr.recipient_user_id = $2` — overrides the top-level `ciphertext` + envelope columns with the per-recipient row's values when present. Senders + non-recipients see the empty sentinel ciphertext (the frontend's plaintext-cache turns that back into plaintext for the sender).
+- **Push preview fallback.** `previewForPush` now emits `🔒 New encrypted message` when the top-level ciphertext is empty (group encrypted send) instead of pushing a blank body.
+
+### Fixed
+- **`messages.controller.edit`** forwards the full `EditMessageDto` to the service instead of the `ciphertext` field only. This unblocks both group fan-out edits and v0.9.x direct E2EE edits that need envelope re-routing.
+- **`ciphertext` validation** in `SendMessageDto` / `EditMessageDto` is now non-empty-optional (allow empty when `recipients[]` is present); previously a group encrypted send would fail validation at the controller before hitting the service.
+
+### Not changed
+- All other endpoints (auth, chats, presence, search, push) — untouched.
+- Direct E2EE persistence path — unchanged.
+- Existing crypto endpoints (`/crypto/devices/keys`, `/crypto/users/:userId/key-bundle`, etc.) — unchanged.
+
+### Operational notes
+- Run `V15__group_message_recipients.sql` (Flyway) before deploying the v0.10.0 api/realtime/frontend images. The new table is empty on first apply.
+- A v0.9.x client sending into a group still works — it'll just send plaintext (no `recipients[]`), and the server stores it plaintext as before.
+- Watch `MessagesService` logger for `VALIDATION_ERROR` from the fan-out path the first day or two; that's the signal that some client is shipping malformed `recipients[]`.
 
 ## v0.9.1 changelog — E2EE hardening
 

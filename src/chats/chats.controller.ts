@@ -64,6 +64,15 @@ export class ChatsController {
     return ok({ chats });
   }
 
+  @Get(':chatId')
+  async getChatById(
+    @Param('chatId') chatId: string,
+    @CurrentUser() user: JwtPayload,
+  ): Promise<ApiResponse<{ chat: ChatDTO }>> {
+    const chat = await this.chatsService.getChatById(chatId, user.sub);
+    return ok({ chat });
+  }
+
   @Get(':chatId/search')
   async searchInChat(
     @Param('chatId') chatId: string,
@@ -83,6 +92,7 @@ export class ChatsController {
     const { messages, nextCursor, hasMore } = await this.chatsService.getMessages(
       chatId,
       user.sub,
+      user.deviceId,
       query.limit,
       query.cursor,
       query.before,

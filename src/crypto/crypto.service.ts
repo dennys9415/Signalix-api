@@ -63,8 +63,32 @@ export class CryptoService {
     }
 
     return this.db.transaction(async (client) => {
+      // v0.10.0 — reset-aware re-register. If this device previously
+      // registered an identity AND the new identity_key differs from
+      // what's stored, the client wiped its local crypto state (v0.9.1
+      // reset detection). Old server-side SPKs + pre-keys reference
+      // private keys this device no longer has — leaving them in place
+      // means `getKeyBundle` could hand a sender an OLD pre-key id, and
+      // the recipient would fail with "Local one-time pre-key X not
+      // found". Wipe both tables for this device before inserting the
+      // new material so subsequent bundle hand-outs only ever reference
+      // keys the local IDB actually holds.
+      const prior = await client.query<{ identity_key: Buffer }>(
+        'SELECT identity_key FROM device_identity_keys WHERE device_id = $1',
+        [deviceId],
+      );
+      const identityChanged =
+        prior.rows.length > 0 && !prior.rows[0].identity_key.equals(identityBuf);
+      if (identityChanged) {
+        this.logger.warn(
+          `Identity key changed for device ${deviceId}; wiping stale SPKs + pre-keys server-side.`,
+        );
+        await client.query('DELETE FROM pre_keys WHERE device_id = $1', [deviceId]);
+        await client.query('DELETE FROM signed_pre_keys WHERE device_id = $1', [deviceId]);
+      }
+
       // Identity is an upsert — re-registering a device replaces its
-      // long-term keys (only meaningful when the local store is wiped).
+      // long-term keys.
       await client.query(
         `
         INSERT INTO device_identity_keys (device_id, registration_id, identity_key, signing_key, key_algorithm)
@@ -112,6 +136,10 @@ export class CryptoService {
       const count = await client.query<{ count: string }>(
         'SELECT COUNT(*)::text AS count FROM pre_keys WHERE device_id = $1 AND consumed_at IS NULL',
         [deviceId],
+      );
+      this.logger.log(
+        `registerDeviceKeys device=${deviceId} reset=${identityChanged} spkKeyId=${dto.signedPreKey.keyId} ` +
+          `preKeyIds=[${dto.preKeys.map((p) => p.keyId).join(',')}] unconsumed=${count.rows[0].count}`,
       );
       return { deviceId, preKeyCount: Number(count.rows[0].count) };
     });
@@ -191,6 +219,10 @@ export class CryptoService {
     const count = await this.db.query<{ count: string }>(
       'SELECT COUNT(*)::text AS count FROM pre_keys WHERE device_id = $1 AND consumed_at IS NULL',
       [deviceId],
+    );
+    this.logger.log(
+      `uploadPreKeys device=${deviceId} added=[${dto.preKeys.map((p) => p.keyId).join(',')}] ` +
+        `unconsumed=${count.rows[0].count}`,
     );
     return { deviceId, preKeyCount: Number(count.rows[0].count) };
   }
@@ -289,6 +321,15 @@ export class CryptoService {
       }
       bundles.push(bundle);
     }
+
+    this.logger.log(
+      `getKeyBundle user=${targetUserId} bundles=[${bundles
+        .map(
+          (b) =>
+            `${b.deviceId}:spk=${b.signedPreKey.keyId}:pk=${b.preKey?.keyId ?? 'none'}`,
+        )
+        .join(';')}]`,
+    );
 
     if (bundles.length === 0) {
       throw new NotFoundException({

@@ -103,7 +103,7 @@ export class MessagesController {
     @Body() dto: EditMessageDto,
     @CurrentUser() user: JwtPayload,
   ): Promise<ApiResponse<EditMessageResponse>> {
-    const result = await this.messagesService.editMessage(messageId, user.sub, dto.ciphertext);
+    const result = await this.messagesService.editMessage(messageId, user.sub, dto);
     return ok(result);
   }
 

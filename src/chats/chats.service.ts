@@ -72,6 +72,14 @@ interface MessageRow {
   recipient_device_id: string | null;
   pre_key_id: number | null;
   signed_pre_key_id: number | null;
+  // v0.10.0 — group_message_recipients row joined on (message_id, viewer).
+  // When the viewer has a per-recipient row for a group encrypted message,
+  // these override the top-level `ciphertext` / envelope columns below.
+  gmr_ciphertext: string | null;
+  gmr_encryption_version: number | null;
+  gmr_recipient_device_id: string | null;
+  gmr_pre_key_id: number | null;
+  gmr_signed_pre_key_id: number | null;
 }
 
 @Injectable()
@@ -187,6 +195,76 @@ export class ChatsService {
     return Array.from(chatsMap.values());
   }
 
+  /**
+   * v0.10.2 — single-chat lookup by id. Used by the realtime server to
+   * canonicalize a `client.chat.created` event before fanning it out to
+   * the chat's participants. Throws `FORBIDDEN` if the caller isn't a
+   * participant and `NOT_FOUND` if the chat doesn't exist; never leaks
+   * the existence of a chat the caller can't see.
+   */
+  async getChatById(chatId: string, userId: string): Promise<ChatDTO> {
+    const result = await this.db.query<ChatRow>(`
+      SELECT
+        c.id          AS chat_id,
+        c.type        AS chat_type,
+        c.title       AS chat_title,
+        c.avatar_url  AS chat_avatar_url,
+        c.description AS chat_description,
+        c.created_by,
+        c.created_at  AS chat_created_at,
+        cp.user_id    AS participant_user_id,
+        cp.role       AS participant_role,
+        cp.joined_at,
+        u.username,
+        u.display_name,
+        u.avatar_url
+      FROM chats c
+      JOIN chat_participants cp ON cp.chat_id = c.id
+      JOIN users u              ON u.id = cp.user_id
+      WHERE c.id = $1
+    `, [chatId]);
+
+    if (result.rows.length === 0) {
+      throw new NotFoundException({
+        code: ErrorCode.CHAT_NOT_FOUND,
+        message: 'Chat not found.',
+      });
+    }
+
+    const isMember = result.rows.some((r) => r.participant_user_id === userId);
+    if (!isMember) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Not a participant in this chat.',
+      });
+    }
+
+    const head = result.rows[0];
+    const chat: ChatDTO = {
+      id: head.chat_id,
+      type: head.chat_type as ChatType,
+      ...(head.chat_title !== null && { title: head.chat_title }),
+      ...(head.chat_avatar_url !== null && { avatarUrl: head.chat_avatar_url }),
+      ...(head.chat_description !== null && { description: head.chat_description }),
+      createdBy: head.created_by,
+      createdAt: head.chat_created_at.toISOString(),
+      participants: result.rows.map((row) => ({
+        chatId: row.chat_id,
+        userId: row.participant_user_id,
+        role: row.participant_role as ParticipantRole,
+        joinedAt: row.joined_at.toISOString(),
+        user: {
+          id: row.participant_user_id,
+          username: row.username,
+          displayName: row.display_name,
+          ...(row.avatar_url !== null && { avatarUrl: row.avatar_url }),
+        },
+      })),
+      unreadCount: 0,
+    };
+    return chat;
+  }
+
   async markChatRead(chatId: string, userId: string): Promise<MarkChatReadResponse> {
     const memberCheck = await this.db.query(
       'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
@@ -236,6 +314,7 @@ export class ChatsService {
   async getMessages(
     chatId: string,
     userId: string,
+    deviceId: string,
     limit: number,
     cursor: string | undefined,
     before: string | undefined,
@@ -260,17 +339,15 @@ export class ChatsService {
       beforeTs = before;
     }
 
-    // $1 = chatId, $2 = userId (for message_deletions exclusion)
-    // Include messages deleted for everyone (shown as placeholders).
-    // Exclude only personal deletions on messages that are NOT globally deleted.
-    // Honor chat_deletions.deleted_at as a visibility cutoff for this user.
+    // $1 = chatId, $2 = userId (for message_deletions exclusion),
+    // $3 = deviceId (for the per-device E2EE recipient row JOIN — v0.10.0).
     const conditions: string[] = [
       'm.chat_id = $1',
       '(m.deleted_at IS NOT NULL OR NOT EXISTS (SELECT 1 FROM message_deletions md WHERE md.message_id = m.id AND md.user_id = $2))',
       '(NOT EXISTS (SELECT 1 FROM chat_deletions cd WHERE cd.chat_id = $1 AND cd.user_id = $2) OR m.created_at > (SELECT cd2.deleted_at FROM chat_deletions cd2 WHERE cd2.chat_id = $1 AND cd2.user_id = $2 LIMIT 1))',
     ];
-    const params: unknown[] = [chatId, userId];
-    let nextIdx = 3;
+    const params: unknown[] = [chatId, userId, deviceId];
+    let nextIdx = 4;
 
     if (beforeTs) {
       conditions.push(`m.created_at < $${nextIdx}::timestamptz`);
@@ -297,6 +374,11 @@ export class ChatsService {
         m.recipient_device_id,
         m.pre_key_id,
         m.signed_pre_key_id,
+        gmr.ciphertext          AS gmr_ciphertext,
+        gmr.encryption_version  AS gmr_encryption_version,
+        gmr.recipient_device_id AS gmr_recipient_device_id,
+        gmr.pre_key_id          AS gmr_pre_key_id,
+        gmr.signed_pre_key_id   AS gmr_signed_pre_key_id,
         m.reply_to       AS reply_to_id,
         rm.sender_id     AS reply_sender_id,
         rm.ciphertext    AS reply_ciphertext,
@@ -315,8 +397,19 @@ export class ChatsService {
       FROM messages m
       LEFT JOIN messages rm ON rm.id = m.reply_to
       LEFT JOIN message_status ms ON ms.message_id = m.id
+      -- v0.10.0: per-recipient ciphertext for fan-out encrypted messages
+      -- (direct + group). The join must match BOTH recipient_user_id and
+      -- recipient_device_id so a multi-device user (e.g. logged into
+      -- Chrome AND Brave) sees only the row encrypted to the device that
+      -- made this request — not all of their devices' rows duplicated.
+      LEFT JOIN group_message_recipients gmr
+        ON gmr.message_id = m.id
+       AND gmr.recipient_user_id = $2
+       AND gmr.recipient_device_id = $3
       WHERE ${conditions.join(' AND ')}
-      GROUP BY m.id, rm.sender_id, rm.ciphertext, rm.deleted_at
+      GROUP BY m.id, rm.sender_id, rm.ciphertext, rm.deleted_at,
+               gmr.ciphertext, gmr.encryption_version, gmr.recipient_device_id,
+               gmr.pre_key_id, gmr.signed_pre_key_id
       ORDER BY m.created_at DESC
       LIMIT $${nextIdx}
     `, params);
@@ -331,12 +424,35 @@ export class ChatsService {
         row.reply_to_id && row.reply_sender_id && !row.reply_deleted_at
           ? { messageId: row.reply_to_id, senderId: row.reply_sender_id, ciphertext: row.reply_ciphertext! }
           : undefined;
+
+      // v0.10.0: if there's a per-recipient row for this viewer, swap in
+      // that ciphertext + envelope. The top-level row remains the system-
+      // of-record for everything else (reply_to, reactions, status).
+      // For senders of a group encrypted message there's no row and we
+      // fall through to the empty top-level ciphertext, which the
+      // frontend's plaintext-cache (or failure cache) resolves.
+      const hasRecipientRow = row.gmr_ciphertext !== null;
+      const baseCiphertext = isDeletedForEveryone
+        ? ''
+        : (hasRecipientRow ? row.gmr_ciphertext! : row.ciphertext);
+      const effectiveVersion = hasRecipientRow
+        ? (row.gmr_encryption_version ?? 1)
+        : row.encryption_version;
+      const effectiveRecipientDeviceId = hasRecipientRow
+        ? row.gmr_recipient_device_id
+        : row.recipient_device_id;
+      const effectivePreKeyId = hasRecipientRow
+        ? row.gmr_pre_key_id
+        : row.pre_key_id;
+      const effectiveSignedPreKeyId = hasRecipientRow
+        ? row.gmr_signed_pre_key_id
+        : row.signed_pre_key_id;
+
       return {
         id: row.id,
         chatId: row.chat_id,
         senderId: row.sender_id,
-        // Censor content for globally-deleted messages; client shows a placeholder
-        ciphertext: isDeletedForEveryone ? '' : row.ciphertext,
+        ciphertext: baseCiphertext,
         messageType: row.message_type as MessageType,
         state: rankToLifecycleState(Number(row.status_rank)),
         createdAt: row.created_at.toISOString(),
@@ -346,13 +462,13 @@ export class ChatsService {
         ...(replyTo && !isDeletedForEveryone && { replyTo }),
         ...(row.is_forwarded && { isForwarded: true }),
         ...(row.link_preview && !isDeletedForEveryone && { linkPreview: row.link_preview as unknown as LinkPreviewDTO }),
-        // Encryption envelope (v0.8.0). Only attached when non-default so
-        // plaintext rows stay clean in the JSON.
-        ...(row.encryption_version > 0 && { encryptionVersion: row.encryption_version }),
+        // Encryption envelope. v0.8.0 wired the columns, v0.9.0 turned on
+        // direct-text values, v0.10.0 fans them out per-recipient for groups.
+        ...(effectiveVersion > 0 && { encryptionVersion: effectiveVersion }),
         ...(row.sender_device_id !== null && { senderDeviceId: row.sender_device_id }),
-        ...(row.recipient_device_id !== null && { recipientDeviceId: row.recipient_device_id }),
-        ...(row.pre_key_id !== null && { preKeyId: row.pre_key_id }),
-        ...(row.signed_pre_key_id !== null && { signedPreKeyId: row.signed_pre_key_id }),
+        ...(effectiveRecipientDeviceId !== null && { recipientDeviceId: effectiveRecipientDeviceId }),
+        ...(effectivePreKeyId !== null && { preKeyId: effectivePreKeyId }),
+        ...(effectiveSignedPreKeyId !== null && { signedPreKeyId: effectiveSignedPreKeyId }),
       };
     });
 

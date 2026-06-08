@@ -20,6 +20,7 @@ import {
   MessageStatusDTO,
   MessageType,
   ReactionResponse,
+  RecipientEnvelopeDTO,
   ReplyPreviewDTO,
   SearchMessagesResponse,
   SendMessageResponse,
@@ -27,7 +28,8 @@ import {
 import { DbService } from '../db/db.service';
 import { LinkPreviewService } from '../link-preview/link-preview.service';
 import { PushService } from '../push/push.service';
-import type { SendMessageDto } from './dto/send-message.dto';
+import type { EditMessageDto } from './dto/edit-message.dto';
+import type { GroupRecipientPayloadDto, SendMessageDto } from './dto/send-message.dto';
 
 interface MessageStatusRow {
   message_id: string;
@@ -143,10 +145,35 @@ export class MessagesService {
       const msgId = randomUUID();
       const now = new Date();
 
-      // Encryption envelope columns are accepted but optional. In v0.8.0 the
-      // frontend's crypto layer always passes `encryptionVersion: 0` (or
-      // omits it) so existing chats keep flowing as plaintext.
-      const envelopeVersion = dto.encryptionVersion ?? 0;
+      // v0.10.0 — per-recipient encrypted fan-out. Accepted for any chat
+      // type (direct + group) so that direct chats with multiple recipient
+      // devices (Chrome + Brave, mobile + desktop) reach all of them. The
+      // top-level body is the empty sentinel; per-recipient rows carry the
+      // ciphertext + envelope. Validation guarantees:
+      //   • the message is TEXT
+      //   • every recipientUserId is a participant of this chat (and not the sender)
+      //   • encryptionVersion >= 1 on the message row
+      const hasGroupFanout = Array.isArray(dto.recipients) && dto.recipients.length > 0;
+      if (hasGroupFanout) {
+        if (dto.messageType !== MessageType.TEXT) {
+          throw new BadRequestException({
+            code: ErrorCode.VALIDATION_ERROR,
+            message: 'E2EE recipients[] covers TEXT messages only in v0.10.0.',
+          });
+        }
+        await assertRecipientsAreParticipants(client, chatId, senderId, dto.recipients!);
+      }
+
+      const envelopeVersion = hasGroupFanout
+        ? Math.max(1, dto.encryptionVersion ?? 1)
+        : (dto.encryptionVersion ?? 0);
+      // For group encrypted sends the on-row ciphertext is a sentinel —
+      // the per-recipient blobs live in `group_message_recipients`.
+      const rowCiphertext = hasGroupFanout ? '' : dto.ciphertext;
+      const rowRecipientDeviceId = hasGroupFanout ? null : (dto.recipientDeviceId ?? null);
+      const rowPreKeyId = hasGroupFanout ? null : (dto.preKeyId ?? null);
+      const rowSignedPreKeyId = hasGroupFanout ? null : (dto.signedPreKeyId ?? null);
+
       await client.query(`
         INSERT INTO messages (
           id, chat_id, sender_id, ciphertext, message_type, reply_to, is_forwarded,
@@ -154,14 +181,44 @@ export class MessagesService {
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
       `, [
-        msgId, chatId, senderId, dto.ciphertext, dto.messageType,
+        msgId, chatId, senderId, rowCiphertext, dto.messageType,
         dto.replyToMessageId ?? null, dto.isForwarded ?? false,
         envelopeVersion,
         dto.senderDeviceId ?? null,
-        dto.recipientDeviceId ?? null,
-        dto.preKeyId ?? null,
-        dto.signedPreKeyId ?? null,
+        rowRecipientDeviceId,
+        rowPreKeyId,
+        rowSignedPreKeyId,
       ]);
+
+      let recipientPayloads: Record<string, RecipientEnvelopeDTO> | undefined;
+      if (hasGroupFanout) {
+        recipientPayloads = {};
+        for (const r of dto.recipients!) {
+          await client.query(
+            `INSERT INTO group_message_recipients
+               (message_id, recipient_user_id, recipient_device_id, ciphertext,
+                encryption_version, pre_key_id, signed_pre_key_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+              msgId,
+              r.recipientUserId,
+              r.recipientDeviceId,
+              r.ciphertext,
+              r.encryptionVersion,
+              r.preKeyId ?? null,
+              r.signedPreKeyId ?? null,
+            ],
+          );
+          recipientPayloads[r.recipientDeviceId] = {
+            ciphertext: r.ciphertext,
+            encryptionVersion: r.encryptionVersion,
+            ...(dto.senderDeviceId !== undefined && { senderDeviceId: dto.senderDeviceId }),
+            recipientDeviceId: r.recipientDeviceId,
+            ...(r.preKeyId !== undefined && { preKeyId: r.preKeyId }),
+            ...(r.signedPreKeyId !== undefined && { signedPreKeyId: r.signedPreKeyId }),
+          };
+        }
+      }
 
       await client.query(
         'INSERT INTO message_status (message_id, user_id, status) VALUES ($1, $2, $3)',
@@ -178,7 +235,9 @@ export class MessagesService {
         id: msgId,
         chatId,
         senderId,
-        ciphertext: dto.ciphertext,
+        // For group encrypted sends the sender sees plaintext via local cache;
+        // serializing the sentinel empty string keeps the wire shape stable.
+        ciphertext: rowCiphertext,
         messageType: dto.messageType,
         state: MessageLifecycleState.SENT,
         createdAt: now.toISOString(),
@@ -186,15 +245,16 @@ export class MessagesService {
         ...(dto.isForwarded && { isForwarded: true }),
         ...(envelopeVersion > 0 && { encryptionVersion: envelopeVersion }),
         ...(dto.senderDeviceId !== undefined && { senderDeviceId: dto.senderDeviceId }),
-        ...(dto.recipientDeviceId !== undefined && { recipientDeviceId: dto.recipientDeviceId }),
-        ...(dto.preKeyId !== undefined && { preKeyId: dto.preKeyId }),
-        ...(dto.signedPreKeyId !== undefined && { signedPreKeyId: dto.signedPreKeyId }),
+        ...(!hasGroupFanout && dto.recipientDeviceId !== undefined && { recipientDeviceId: dto.recipientDeviceId }),
+        ...(!hasGroupFanout && dto.preKeyId !== undefined && { preKeyId: dto.preKeyId }),
+        ...(!hasGroupFanout && dto.signedPreKeyId !== undefined && { signedPreKeyId: dto.signedPreKeyId }),
       };
 
       return {
         message,
         chatId,
         ...(dto.tempId ? { tempId: dto.tempId } : {}),
+        ...(recipientPayloads ? { recipientPayloads } : {}),
       };
     });
 
@@ -434,63 +494,145 @@ export class MessagesService {
   async editMessage(
     messageId: string,
     userId: string,
-    ciphertext: string,
+    dto: EditMessageDto,
   ): Promise<EditMessageResponse> {
-    const msgResult = await this.db.query<{
-      chat_id: string;
-      sender_id: string;
-      deleted_at: Date | null;
-    }>(
-      'SELECT chat_id, sender_id, deleted_at FROM messages WHERE id = $1',
-      [messageId],
-    );
+    return this.db.transaction(async (client) => {
+      const msgResult = await client.query<{
+        chat_id: string;
+        sender_id: string;
+        deleted_at: Date | null;
+      }>(
+        `SELECT chat_id, sender_id, deleted_at FROM messages WHERE id = $1`,
+        [messageId],
+      );
 
-    if (!msgResult.rows[0]) {
-      throw new NotFoundException({
-        code: ErrorCode.MESSAGE_NOT_FOUND,
-        message: 'Message not found.',
-      });
-    }
+      if (!msgResult.rows[0]) {
+        throw new NotFoundException({
+          code: ErrorCode.MESSAGE_NOT_FOUND,
+          message: 'Message not found.',
+        });
+      }
 
-    const { chat_id: chatId, sender_id: senderId, deleted_at: deletedAt } = msgResult.rows[0];
+      const { chat_id: chatId, sender_id: senderId, deleted_at: deletedAt } = msgResult.rows[0];
 
-    if (senderId !== userId) {
-      throw new ForbiddenException({
-        code: ErrorCode.FORBIDDEN,
-        message: 'Only the sender can edit this message.',
-      });
-    }
+      if (senderId !== userId) {
+        throw new ForbiddenException({
+          code: ErrorCode.FORBIDDEN,
+          message: 'Only the sender can edit this message.',
+        });
+      }
 
-    if (deletedAt) {
-      throw new ForbiddenException({
-        code: ErrorCode.FORBIDDEN,
-        message: 'Cannot edit a deleted message.',
-      });
-    }
+      if (deletedAt) {
+        throw new ForbiddenException({
+          code: ErrorCode.FORBIDDEN,
+          message: 'Cannot edit a deleted message.',
+        });
+      }
 
-    const participantCheck = await this.db.query(
-      'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
-      [chatId, userId],
-    );
+      const participantCheck = await client.query(
+        'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+        [chatId, userId],
+      );
 
-    if (participantCheck.rows.length === 0) {
-      throw new ForbiddenException({
-        code: ErrorCode.FORBIDDEN,
-        message: 'Not a participant in this chat.',
-      });
-    }
+      if (participantCheck.rows.length === 0) {
+        throw new ForbiddenException({
+          code: ErrorCode.FORBIDDEN,
+          message: 'Not a participant in this chat.',
+        });
+      }
 
-    const result = await this.db.query<{ edited_at: Date }>(
-      'UPDATE messages SET ciphertext = $1, edited_at = NOW() WHERE id = $2 RETURNING edited_at',
-      [ciphertext, messageId],
-    );
+      // v0.10.0 — encrypted re-fan-out on edit (accepted for direct and
+      // group chats so multi-device direct edits work too).
+      const hasGroupFanout = Array.isArray(dto.recipients) && dto.recipients.length > 0;
+      if (hasGroupFanout) {
+        await assertRecipientsAreParticipants(client, chatId, senderId, dto.recipients!);
+      }
 
-    return {
-      messageId,
-      chatId,
-      ciphertext,
-      editedAt: result.rows[0].edited_at.toISOString(),
-    };
+      const envelopeVersion = hasGroupFanout
+        ? Math.max(1, dto.encryptionVersion ?? 1)
+        : (dto.encryptionVersion ?? undefined);
+      const rowCiphertext = hasGroupFanout ? '' : dto.ciphertext;
+
+      // For direct E2EE edits we also let the envelope columns shift (the
+      // re-encrypted body uses a fresh ECDH session). For group encrypted
+      // edits the top-level envelope columns are nulled and the per-recipient
+      // rows carry the new state.
+      const rowRecipientDeviceId = hasGroupFanout ? null : (dto.recipientDeviceId ?? undefined);
+      const rowPreKeyId = hasGroupFanout ? null : (dto.preKeyId ?? undefined);
+      const rowSignedPreKeyId = hasGroupFanout ? null : (dto.signedPreKeyId ?? undefined);
+
+      const sets: string[] = ['ciphertext = $1', 'edited_at = NOW()'];
+      const params: unknown[] = [rowCiphertext];
+      let i = 2;
+      if (envelopeVersion !== undefined) {
+        sets.push(`encryption_version = $${i++}`);
+        params.push(envelopeVersion);
+      }
+      if (dto.senderDeviceId !== undefined) {
+        sets.push(`sender_device_id = $${i++}`);
+        params.push(dto.senderDeviceId);
+      }
+      if (rowRecipientDeviceId !== undefined) {
+        sets.push(`recipient_device_id = $${i++}`);
+        params.push(rowRecipientDeviceId);
+      }
+      if (rowPreKeyId !== undefined) {
+        sets.push(`pre_key_id = $${i++}`);
+        params.push(rowPreKeyId);
+      }
+      if (rowSignedPreKeyId !== undefined) {
+        sets.push(`signed_pre_key_id = $${i++}`);
+        params.push(rowSignedPreKeyId);
+      }
+      params.push(messageId);
+
+      const result = await client.query<{ edited_at: Date }>(
+        `UPDATE messages SET ${sets.join(', ')} WHERE id = $${i} RETURNING edited_at`,
+        params,
+      );
+
+      let recipientPayloads: Record<string, RecipientEnvelopeDTO> | undefined;
+      if (hasGroupFanout) {
+        await client.query(
+          'DELETE FROM group_message_recipients WHERE message_id = $1',
+          [messageId],
+        );
+        recipientPayloads = {};
+        for (const r of dto.recipients!) {
+          await client.query(
+            `INSERT INTO group_message_recipients
+               (message_id, recipient_user_id, recipient_device_id, ciphertext,
+                encryption_version, pre_key_id, signed_pre_key_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+              messageId,
+              r.recipientUserId,
+              r.recipientDeviceId,
+              r.ciphertext,
+              r.encryptionVersion,
+              r.preKeyId ?? null,
+              r.signedPreKeyId ?? null,
+            ],
+          );
+          recipientPayloads[r.recipientDeviceId] = {
+            ciphertext: r.ciphertext,
+            encryptionVersion: r.encryptionVersion,
+            ...(dto.senderDeviceId !== undefined && { senderDeviceId: dto.senderDeviceId }),
+            recipientDeviceId: r.recipientDeviceId,
+            ...(r.preKeyId !== undefined && { preKeyId: r.preKeyId }),
+            ...(r.signedPreKeyId !== undefined && { signedPreKeyId: r.signedPreKeyId }),
+          };
+        }
+      }
+
+      return {
+        messageId,
+        chatId,
+        ciphertext: rowCiphertext,
+        editedAt: result.rows[0].edited_at.toISOString(),
+        ...(recipientPayloads ? { recipientPayloads } : {}),
+      };
+    });
   }
 
   async setReaction(
@@ -752,7 +894,42 @@ function previewForPush(ciphertext: string, type: MessageType): string {
     }
   }
   const trimmed = ciphertext.trim();
+  // v0.10.0 — group encrypted TEXT messages persist an empty top-level
+  // ciphertext (the body lives per-recipient). Push previews should fall
+  // back to a generic notice rather than ship "" or the raw envelope.
+  if (!trimmed) return '🔒 New encrypted message';
   return trimmed.length > 140 ? `${trimmed.slice(0, 140)}…` : trimmed;
+}
+
+/**
+ * v0.10.0 — verify every recipient in a group E2EE fan-out is a real
+ * participant of the chat and not the sender. Throws 400 if anyone
+ * fails the check. Called inside the same transaction as the inserts
+ * so we can't TOCTOU between the read and the writes.
+ */
+async function assertRecipientsAreParticipants(
+  client: { query: (sql: string, params?: unknown[]) => Promise<{ rows: Array<{ user_id: string }> }> },
+  chatId: string,
+  senderId: string,
+  recipients: GroupRecipientPayloadDto[],
+): Promise<void> {
+  const ids = [...new Set(recipients.map((r) => r.recipientUserId))];
+  if (ids.includes(senderId)) {
+    throw new BadRequestException({
+      code: ErrorCode.VALIDATION_ERROR,
+      message: 'Sender must not appear in recipients[].',
+    });
+  }
+  const present = await client.query(
+    'SELECT user_id FROM chat_participants WHERE chat_id = $1 AND user_id = ANY($2::uuid[])',
+    [chatId, ids],
+  );
+  if (present.rows.length !== ids.length) {
+    throw new BadRequestException({
+      code: ErrorCode.VALIDATION_ERROR,
+      message: 'One or more recipients are not participants of this chat.',
+    });
+  }
 }
 
 function toStatusDTO(row: MessageStatusRow): MessageStatusDTO {
