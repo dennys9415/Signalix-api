@@ -800,7 +800,16 @@ export class MessagesService {
       ) other_user ON c.type = 'direct'
       WHERE m.message_type = 'text'
         AND m.deleted_at IS NULL
-        AND m.ciphertext ILIKE $2 ESCAPE '\\'
+        -- v0.13.0 — match on any of: legacy plaintext ciphertext (encrypted
+        -- rows have empty string since v0.10.0 and never match), the chat
+        -- group title, the sender username, or the sender display name.
+        -- The ESCAPE clause pairs with the JS-side LIKE-metachar escape.
+        AND (
+          m.ciphertext        ILIKE $2 ESCAPE '\\'
+          OR (c.type = 'group' AND c.title ILIKE $2 ESCAPE '\\')
+          OR sender.username      ILIKE $2 ESCAPE '\\'
+          OR sender.display_name  ILIKE $2 ESCAPE '\\'
+        )
         AND EXISTS (
           SELECT 1 FROM chat_participants cp
           WHERE cp.chat_id = m.chat_id AND cp.user_id = $1

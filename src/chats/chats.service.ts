@@ -925,7 +925,16 @@ export class ChatsService {
       WHERE m.chat_id = $1
         AND m.deleted_at IS NULL
         AND m.message_type IN ('text', 'file')
-        AND m.ciphertext ILIKE $3 ESCAPE '\\'
+        -- v0.13.0 — match either the (legacy plaintext) ciphertext or the
+        -- sender's username / display name. v0.10.0+ encrypted bodies
+        -- have ciphertext = '' on the row, so server-side ILIKE alone is
+        -- blind to them; the frontend's local search over the plaintext
+        -- cache complements this on the client side.
+        AND (
+          m.ciphertext       ILIKE $3 ESCAPE '\\'
+          OR u.username      ILIKE $3 ESCAPE '\\'
+          OR u.display_name  ILIKE $3 ESCAPE '\\'
+        )
         AND NOT EXISTS (
           SELECT 1 FROM message_deletions md
           WHERE md.message_id = m.id AND md.user_id = $2

@@ -1,6 +1,6 @@
 # Signalix API
 
-**Version: v0.12.0**
+**Version: v0.13.0**
 
 NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, the v0.8.0 crypto foundation, v0.9.x **direct-text E2EE**, and **v0.10.0 group-text E2EE beta** — group text sends now persist one row per (message × recipient × device) in `group_message_recipients` while the `messages` row carries an empty sentinel ciphertext.
 
@@ -334,6 +334,17 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 ```
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
+
+## v0.13.0 changelog — Message search WHERE extension
+
+### Added
+- **`MessagesService.searchMessages`** now matches on `messages.ciphertext` (legacy plaintext rows — encrypted rows are empty since v0.10.0 and never match), `chats.title` (group titles), `sender.username`, and `sender.display_name`. ESCAPE clause preserved.
+- **`ChatsService.searchInChat`** same extension scoped to a single chat: ciphertext OR sender username OR sender display_name.
+- Both keep their existing per-user-deletion + chat-deletion visibility cutoffs and keyset pagination.
+
+### Not changed
+- Endpoint paths, request DTOs, response shapes — unchanged. No new tables, no migration.
+- The encrypted message body is still server-blind by design — the client-side walk in `Signalix-frontend/src/lib/local-search.ts` is the deliberate compensating mechanism for v0.10.0+ E2EE bodies.
 
 ## v0.12.0 changelog — Safety number / device verification UI (api no-op)
 
