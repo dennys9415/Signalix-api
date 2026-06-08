@@ -1,6 +1,6 @@
 # Signalix API
 
-**Version: v0.10.1**
+**Version: v0.11.0**
 
 NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, the v0.8.0 crypto foundation, v0.9.x **direct-text E2EE**, and **v0.10.0 group-text E2EE beta** — group text sends now persist one row per (message × recipient × device) in `group_message_recipients` while the `messages` row carries an empty sentinel ciphertext.
 
@@ -334,6 +334,22 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 ```
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
+
+## v0.11.0 changelog — Media / file / voice E2EE beta
+
+### Added
+- **`POST /api/v1/media/encrypted-blob`** in `MediaController` — uploads pre-encrypted (AES-GCM ciphertext) bytes as an opaque blob. No MIME validation (the bytes are random-looking ciphertext); 25 MB size cap matches the largest legacy attachment kind. Object key format `encrypted/{userId}/{uuid}.bin` under the existing media bucket. Returns `{ url, size }`.
+- **`MediaService.uploadEncryptedBlob`** wraps the upload with the new size cap + key path.
+- **`MessagesService.sendMessage`** — the previous `messageType !== TEXT` guard on `recipients[]` has been lifted. IMAGE / FILE / AUDIO messages now flow through the per-recipient envelope path; the per-recipient ciphertext is an envelope around the attachment's metadata JSON (`{ v:1, url, mediaKey, iv, mime, size, filename?, duration? }`).
+
+### Not changed
+- Plaintext upload endpoints (`/media/upload`, `/media/voice`, `/files/upload`) remain available. Legacy callers keep working.
+- No DB migration. No new env vars.
+- All other endpoints, presence, push, search — untouched.
+
+### Operational notes
+- The new object key prefix is `encrypted/{userId}/{uuid}.bin` under the existing media bucket. No bucket policy change required.
+- Watch the `MediaService` logger for size-cap rejections in case clients try to upload >25 MB encrypted attachments.
 
 ## v0.10.1 changelog — Multi-device hygiene + group-create broadcast
 

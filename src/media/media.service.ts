@@ -28,6 +28,10 @@ const ALLOWED_AUDIO_MIME = new Set([
 ]);
 
 const MAX_BYTES = 10 * 1024 * 1024;
+// v0.11.0 — encrypted blob ceiling. Same as files (25 MB) so the
+// encrypted variant covers everything the plaintext file path used to.
+// AES-GCM adds 16 bytes of auth tag, negligible at this scale.
+const MAX_ENCRYPTED_BYTES = 25 * 1024 * 1024;
 
 @Injectable()
 export class MediaService {
@@ -66,6 +70,41 @@ export class MediaService {
     const ext = pickAudioExt(file);
     const key = `voice/${userId}/${randomUUID()}${ext}`;
     return this.storage.upload(key, file.buffer, file.mimetype, this.config.minioMediaBucket);
+  }
+
+  /**
+   * v0.11.0 — accept a pre-encrypted blob (AES-GCM ciphertext produced
+   * client-side, opaque to the server). MIME validation is skipped on
+   * purpose: the stored bytes are random-looking ciphertext, not the
+   * original image/audio/document. The size cap covers the largest
+   * attachment kind (files at 25 MB pre-encryption + auth tag).
+   *
+   * Object key uses `encrypted/{userId}/{uuid}.bin` so the encrypted
+   * objects are visibly distinct from the legacy plaintext paths in
+   * MinIO. Returns the public URL — the URL itself is non-sensitive
+   * (knowing it only grants access to ciphertext, which is useless
+   * without the media key carried in the per-recipient envelope).
+   */
+  async uploadEncryptedBlob(
+    userId: string,
+    file: Express.Multer.File,
+  ): Promise<{ url: string; size: number }> {
+    if (!file) {
+      throw new BadRequestException('No blob provided');
+    }
+    if (file.size > MAX_ENCRYPTED_BYTES) {
+      throw new BadRequestException(
+        `Encrypted blob exceeds ${MAX_ENCRYPTED_BYTES / (1024 * 1024)} MB limit`,
+      );
+    }
+    const key = `encrypted/${userId}/${randomUUID()}.bin`;
+    const url = await this.storage.upload(
+      key,
+      file.buffer,
+      'application/octet-stream',
+      this.config.minioMediaBucket,
+    );
+    return { url, size: file.size };
   }
 }
 

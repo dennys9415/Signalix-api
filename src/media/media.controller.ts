@@ -31,4 +31,24 @@ export class MediaController {
     const voiceUrl = await this.media.uploadVoice(user.sub, file);
     return ok({ voiceUrl });
   }
+
+  /**
+   * v0.11.0 — encrypted-blob upload. The client encrypts an
+   * image/file/voice locally with a per-attachment AES-GCM key and
+   * uploads the resulting ciphertext as opaque bytes. Authorization is
+   * still JWT-based (the user must be authenticated to push bytes into
+   * their bucket prefix), but content validation is skipped — the bytes
+   * are random-looking ciphertext, not a media file. The returned URL
+   * is public; access control is moot because the bytes are useless
+   * without the media key, which only the per-recipient envelope holds.
+   */
+  @Post('encrypted-blob')
+  @UseInterceptors(FileInterceptor('blob', { storage: memoryStorage() }))
+  async uploadEncryptedBlob(
+    @CurrentUser() user: JwtPayload,
+    @UploadedFile() file: Express.Multer.File,
+  ): Promise<ApiResponse<{ url: string; size: number }>> {
+    const result = await this.media.uploadEncryptedBlob(user.sub, file);
+    return ok(result);
+  }
 }

@@ -145,22 +145,18 @@ export class MessagesService {
       const msgId = randomUUID();
       const now = new Date();
 
-      // v0.10.0 — per-recipient encrypted fan-out. Accepted for any chat
-      // type (direct + group) so that direct chats with multiple recipient
-      // devices (Chrome + Brave, mobile + desktop) reach all of them. The
-      // top-level body is the empty sentinel; per-recipient rows carry the
-      // ciphertext + envelope. Validation guarantees:
-      //   • the message is TEXT
+      // v0.10.0 / v0.11.0 — per-recipient encrypted fan-out. Accepted for
+      // any chat type (direct + group) and any sendable message type:
+      // v0.10.x covered TEXT; v0.11.0 extends to IMAGE / FILE / AUDIO,
+      // where the per-recipient ciphertext is an envelope around the
+      // attachment's metadata JSON (`{ url, mediaKey, iv, mime, size,
+      // filename?, duration? }`). The encrypted blob itself lives in
+      // MinIO under the `encrypted/` path prefix — see
+      // `MediaController.uploadEncryptedBlob`. Validation guarantees:
       //   • every recipientUserId is a participant of this chat (and not the sender)
       //   • encryptionVersion >= 1 on the message row
       const hasGroupFanout = Array.isArray(dto.recipients) && dto.recipients.length > 0;
       if (hasGroupFanout) {
-        if (dto.messageType !== MessageType.TEXT) {
-          throw new BadRequestException({
-            code: ErrorCode.VALIDATION_ERROR,
-            message: 'E2EE recipients[] covers TEXT messages only in v0.10.0.',
-          });
-        }
         await assertRecipientsAreParticipants(client, chatId, senderId, dto.recipients!);
       }
 
