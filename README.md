@@ -1,6 +1,6 @@
 # Signalix API
 
-**Version: v0.15.0**
+**Version: v0.16.0**
 
 NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, the v0.8.0 crypto foundation, v0.9.x **direct-text E2EE**, and **v0.10.0 group-text E2EE beta** — group text sends now persist one row per (message × recipient × device) in `group_message_recipients` while the `messages` row carries an empty sentinel ciphertext.
 
@@ -334,6 +334,11 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 ```
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
+
+## v0.16.0 changelog — Mobile foundation MVP (api no-op)
+
+### Not changed
+- v0.16.0 introduces the new `Signalix-mobile` repository (React Native + Expo SDK 54). The mobile app consumes existing REST endpoints + WebSocket events as-is — no new API endpoints, no DB migration, no env var changes. The server-side surface is byte-identical to v0.15.0.
 
 ## v0.15.0 changelog — Key backup & device recovery (api no-op)
 
