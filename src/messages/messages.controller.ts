@@ -16,6 +16,7 @@ import type {
   DeleteMessageForEveryoneResponse,
   DeleteMessageForMeResponse,
   EditMessageResponse,
+  GetMessageRecipientsStatusResponse,
   MessageStatusDTO,
   ReactionResponse,
   SearchMessagesResponse,
@@ -74,6 +75,26 @@ export class MessagesController {
       dto.status,
     );
     return ok(result);
+  }
+
+  /**
+   * v0.14.0 — per-recipient status for a message. The Message Info
+   * dialog uses this to render the "Read by / Delivered to / Sent to"
+   * breakdown in groups. Direct chats also get a one-row response so
+   * the sender can see when the recipient delivered + read.
+   *
+   * Authorization: caller must be a participant of the message's chat.
+   */
+  @Get(':messageId/recipients/status')
+  async getRecipientsStatus(
+    @Param('messageId') messageId: string,
+    @CurrentUser() user: JwtPayload,
+  ): Promise<ApiResponse<GetMessageRecipientsStatusResponse>> {
+    const statuses = await this.messagesService.getMessageRecipientStatuses(
+      messageId,
+      user.sub,
+    );
+    return ok({ messageId, statuses });
   }
 
   @Post(':messageId/delete-for-me')

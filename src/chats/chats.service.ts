@@ -318,7 +318,13 @@ export class ChatsService {
     limit: number,
     cursor: string | undefined,
     before: string | undefined,
-  ): Promise<{ messages: MessageDTO[]; nextCursor: string | undefined; hasMore: boolean }> {
+    since?: string,
+  ): Promise<{
+    messages: MessageDTO[];
+    nextCursor: string | undefined;
+    hasMore: boolean;
+    statusUpdates?: import('@signalix/contracts').MessageStatusDTO[];
+  }> {
     const memberCheck = await this.db.query(
       'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
       [chatId, userId],
@@ -478,7 +484,37 @@ export class ChatsService {
         ? Buffer.from(lastRow.created_at.toISOString()).toString('base64')
         : undefined;
 
-    return { messages, nextCursor, hasMore };
+    // v0.14.0 reconnect-sync — when the caller supplied `since`, also
+    // emit per-recipient status changes the client may have missed
+    // while its WS was disconnected. Bounded to 200 to keep the
+    // response reasonable; clients that hit the cap fall back to a
+    // full reload of the chat.
+    let statusUpdates: import('@signalix/contracts').MessageStatusDTO[] | undefined;
+    if (since) {
+      const statusRows = await this.db.query<{
+        message_id: string;
+        user_id: string;
+        status: string;
+        timestamp: Date;
+      }>(`
+        SELECT ms.message_id, ms.user_id, ms.status, ms.timestamp
+        FROM message_status ms
+        JOIN messages m ON m.id = ms.message_id
+        WHERE m.chat_id = $1
+          AND ms.timestamp > $2::timestamptz
+          AND m.deleted_at IS NULL
+        ORDER BY ms.timestamp ASC
+        LIMIT 200
+      `, [chatId, since]);
+      statusUpdates = statusRows.rows.map((r) => ({
+        messageId: r.message_id,
+        userId: r.user_id,
+        status: r.status as import('@signalix/contracts').MessageStatus,
+        timestamp: r.timestamp.toISOString(),
+      }));
+    }
+
+    return { messages, nextCursor, hasMore, ...(statusUpdates && { statusUpdates }) };
   }
 
   async createGroupChat(

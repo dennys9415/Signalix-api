@@ -89,13 +89,14 @@ export class ChatsController {
     @CurrentUser() user: JwtPayload,
     @Query() query: GetMessagesDto,
   ): Promise<ApiResponse<GetMessagesResponse>> {
-    const { messages, nextCursor, hasMore } = await this.chatsService.getMessages(
+    const { messages, nextCursor, hasMore, statusUpdates } = await this.chatsService.getMessages(
       chatId,
       user.sub,
       user.deviceId,
       query.limit,
       query.cursor,
       query.before,
+      query.since,
     );
     return ok({
       messages,
@@ -103,6 +104,7 @@ export class ChatsController {
         hasMore,
         ...(nextCursor !== undefined && { nextCursor }),
       },
+      ...(statusUpdates && { statusUpdates }),
     });
   }
 

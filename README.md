@@ -1,6 +1,6 @@
 # Signalix API
 
-**Version: v0.13.0**
+**Version: v0.14.0**
 
 NestJS REST API for Signalix. Handles authentication, user management, direct + group chats, messages (text / image / file / voice notes), reactions, replies, forwards, edit, delete-for-me / for-everyone, link previews, avatars, presence, transactional email, Web Push delivery, the v0.8.0 crypto foundation, v0.9.x **direct-text E2EE**, and **v0.10.0 group-text E2EE beta** — group text sends now persist one row per (message × recipient × device) in `group_message_recipients` while the `messages` row carries an empty sentinel ciphertext.
 
@@ -334,6 +334,17 @@ docker build -f Signalix-api/Dockerfile -t signalix-api .
 ```
 
 The preferred way for local development is `Signalix-infra` Docker Compose, which handles the build context, service dependencies, and Flyway migrations automatically.
+
+## v0.14.0 changelog — Per-recipient status + reconnect sync
+
+### Added
+- **`GET /messages/:messageId/recipients/status`** in `MessagesController` → `GetMessageRecipientsStatusResponse { messageId, statuses }`. Service method `getMessageRecipientStatuses` returns one row per chat participant (excluding sender), backfilled with implicit `SENT` at the message's `created_at` for participants without a `message_status` row. Authorization: caller must be a participant.
+- **`GET /chats/:chatId/messages?since=<iso>`** — existing endpoint accepts a `since` cursor. When provided, the response also carries `statusUpdates: MessageStatusDTO[]` listing per-recipient receipts whose timestamp is strictly greater than `since` (bounded to 200). Used by the frontend's reconnect catch-up flow.
+- **`GetMessagesDto.since`** validator (ISO8601 optional).
+
+### Not changed
+- `message_status` schema, the `READ always wins` rank logic in `updateStatus`, the rest of the messages/chats API.
+- No new DB migration.
 
 ## v0.13.0 changelog — Message search WHERE extension
 

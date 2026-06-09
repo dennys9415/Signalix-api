@@ -389,6 +389,67 @@ export class MessagesService {
     return toStatusDTO(currentResult.rows[0]);
   }
 
+  /**
+   * v0.14.0 — per-recipient delivery/read state for a message. Returns
+   * one row per chat participant other than the sender. Senders see
+   * their own implicit SENT state by default; participants who have
+   * never had a row in `message_status` (haven't delivered yet) are
+   * filled in with the implicit SENT timestamp = message.created_at.
+   */
+  async getMessageRecipientStatuses(
+    messageId: string,
+    userId: string,
+  ): Promise<MessageStatusDTO[]> {
+    const msgRow = await this.db.query<{ chat_id: string; sender_id: string; created_at: Date }>(
+      'SELECT chat_id, sender_id, created_at FROM messages WHERE id = $1 AND deleted_at IS NULL',
+      [messageId],
+    );
+    if (!msgRow.rows[0]) {
+      throw new NotFoundException({
+        code: ErrorCode.MESSAGE_NOT_FOUND,
+        message: 'Message not found.',
+      });
+    }
+    const { chat_id: chatId, sender_id: senderId, created_at: createdAt } = msgRow.rows[0];
+
+    const memberCheck = await this.db.query(
+      'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
+      [chatId, userId],
+    );
+    if (memberCheck.rows.length === 0) {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Not a participant in this chat.',
+      });
+    }
+
+    // Left join chat_participants × message_status so participants who
+    // never advanced past SENT (no row in message_status) still appear,
+    // labelled SENT at the message's creation time.
+    const rows = await this.db.query<{
+      user_id: string;
+      status: string;
+      timestamp: Date;
+    }>(`
+      SELECT
+        cp.user_id,
+        COALESCE(ms.status, 'sent')                AS status,
+        COALESCE(ms.timestamp, $3::timestamptz)    AS timestamp
+      FROM chat_participants cp
+      LEFT JOIN message_status ms
+        ON ms.message_id = $1 AND ms.user_id = cp.user_id
+      WHERE cp.chat_id = $2 AND cp.user_id <> $4
+      ORDER BY cp.user_id
+    `, [messageId, chatId, createdAt, senderId]);
+
+    return rows.rows.map((r) => ({
+      messageId,
+      userId: r.user_id,
+      status: r.status as MessageStatus,
+      timestamp: r.timestamp.toISOString(),
+    }));
+  }
+
   async deleteForMe(
     messageId: string,
     userId: string,
