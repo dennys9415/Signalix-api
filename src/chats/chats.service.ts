@@ -5,6 +5,7 @@ import {
   ChatDTO,
   ChatParticipantDTO,
   ChatType,
+  ClearChatResponse,
   DeleteChatForMeResponse,
   ErrorCode,
   GroupAvatarUploadResponse,
@@ -115,6 +116,7 @@ export class ChatsService {
         SELECT 1 FROM chat_deletions cd
         WHERE cd.chat_id = c.id
           AND cd.user_id = $1
+          AND NOT cd.keep_in_list
           AND NOT EXISTS (
             SELECT 1 FROM messages m2
             WHERE m2.chat_id = c.id AND m2.created_at > cd.deleted_at
@@ -1089,6 +1091,17 @@ export class ChatsService {
   }
 
   async deleteChatForMe(chatId: string, userId: string): Promise<DeleteChatForMeResponse> {
+    const deletedAt = await this.setChatCutoff(chatId, userId, false);
+    return { chatId, deletedAt };
+  }
+
+  /** Clear chat: same per-user message cutoff as delete, but the chat stays listed. */
+  async clearChatForMe(chatId: string, userId: string): Promise<ClearChatResponse> {
+    const clearedAt = await this.setChatCutoff(chatId, userId, true);
+    return { chatId, clearedAt };
+  }
+
+  private async setChatCutoff(chatId: string, userId: string, keepInList: boolean): Promise<string> {
     const memberCheck = await this.db.query(
       'SELECT 1 FROM chat_participants WHERE chat_id = $1 AND user_id = $2',
       [chatId, userId],
@@ -1102,14 +1115,14 @@ export class ChatsService {
     }
 
     const result = await this.db.query<{ deleted_at: Date }>(`
-      INSERT INTO chat_deletions (chat_id, user_id)
-      VALUES ($1, $2)
+      INSERT INTO chat_deletions (chat_id, user_id, keep_in_list)
+      VALUES ($1, $2, $3)
       ON CONFLICT (chat_id, user_id) DO UPDATE
-        SET deleted_at = NOW()
+        SET deleted_at = NOW(), keep_in_list = EXCLUDED.keep_in_list
       RETURNING deleted_at
-    `, [chatId, userId]);
+    `, [chatId, userId, keepInList]);
 
-    return { chatId, deletedAt: result.rows[0].deleted_at.toISOString() };
+    return result.rows[0].deleted_at.toISOString();
   }
 }
 

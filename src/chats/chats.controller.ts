@@ -19,6 +19,7 @@ import type {
   ApiResponse,
   ChatDTO,
   CreateGroupChatResponse,
+  ClearChatResponse,
   DeleteChatForMeResponse,
   GetMessagesResponse,
   GroupAvatarUploadResponse,
@@ -125,6 +126,16 @@ export class ChatsController {
     @CurrentUser() user: JwtPayload,
   ): Promise<ApiResponse<DeleteChatForMeResponse>> {
     const result = await this.chatsService.deleteChatForMe(chatId, user.sub);
+    return ok(result);
+  }
+
+  @Post(':chatId/clear')
+  @HttpCode(HttpStatus.OK)
+  async clearChat(
+    @Param('chatId') chatId: string,
+    @CurrentUser() user: JwtPayload,
+  ): Promise<ApiResponse<ClearChatResponse>> {
+    const result = await this.chatsService.clearChatForMe(chatId, user.sub);
     return ok(result);
   }
 
