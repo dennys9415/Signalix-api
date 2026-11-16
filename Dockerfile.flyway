@@ -1,0 +1,4 @@
+# Flyway with the API's migrations baked in, for hosts (Coolify) where the
+# migrations folder can't be bind-mounted like in Signalix-infra.
+FROM flyway/flyway:10
+COPY migrations /flyway/sql

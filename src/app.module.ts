@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from './auth/auth.module';
+import { CallsModule } from './calls/calls.module';
 import { ChatsModule } from './chats/chats.module';
 import { ConfigModule } from './config/config.module';
 import { CryptoModule } from './crypto/crypto.module';
@@ -14,6 +15,6 @@ import { PushModule } from './push/push.module';
 import { UsersModule } from './users/users.module';
 
 @Module({
-  imports: [ConfigModule, DbModule, AuthModule, UsersModule, ChatsModule, MessagesModule, PresenceModule, ProfileModule, MediaModule, FilesModule, LinkPreviewModule, PushModule, CryptoModule],
+  imports: [ConfigModule, DbModule, AuthModule, UsersModule, ChatsModule, MessagesModule, PresenceModule, ProfileModule, MediaModule, FilesModule, LinkPreviewModule, PushModule, CryptoModule, CallsModule],
 })
 export class AppModule {}

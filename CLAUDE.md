@@ -43,6 +43,11 @@ V8__message_reactions.sql — emoji reactions
 V9__message_reply_forward.sql — reply/forward metadata
 V10__link_preview.sql     — link_preview JSONB column on messages
 V11__read_state.sql       — chat_read_state table for persistent unread counts
+V12__push_subscriptions.sql — web push subscriptions
+V13__chats_avatar_description.sql — group avatar + description
+V14__crypto_foundation.sql — E2EE device keys + pre-keys
+V15__group_message_recipients.sql — per-recipient group ciphertexts
+V16__calls.sql            — 1:1 voice/video call log (v0.17.0)
 ```
 
 Never edit a deployed migration. Always add a new file.

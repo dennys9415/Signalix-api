@@ -138,4 +138,28 @@ export class ConfigService {
   get vapidSubject(): string {
     return this.require('VAPID_SUBJECT', 'mailto:admin@signalix.local');
   }
+
+  // v0.17.0 — WebRTC ICE servers for calls. Comma-separated URL lists.
+  // TURN is optional: without TURN_URLS + TURN_SECRET only STUN is offered,
+  // which works on the same LAN but fails behind symmetric NAT.
+  get iceStunUrls(): string[] {
+    return this.list(this.require('ICE_STUN_URLS', 'stun:stun.l.google.com:19302'));
+  }
+
+  get turnUrls(): string[] {
+    return this.list(this.require('TURN_URLS', ''));
+  }
+
+  // Must match coturn's `static-auth-secret`.
+  get turnSecret(): string {
+    return this.require('TURN_SECRET', '');
+  }
+
+  get turnTtlSeconds(): number {
+    return parseInt(this.require('TURN_TTL_SECONDS', '43200'), 10);
+  }
+
+  private list(value: string): string[] {
+    return value.split(',').map((v) => v.trim()).filter(Boolean);
+  }
 }
